@@ -13,11 +13,26 @@ al. 2021, JHM). Goals, in order:
    the entire simulation (verified against finite differences). Gradient
    targets: Manning n fields, bathymetry corrections, forcing. Long events
    backprop via gradient checkpointing (`checkpoint_every`).
-3. **Separation of concerns**: the CREST water balance is stripped. In the
-   CREST-AI deployment, EF5/CREST runs upstream and supplies initial
-   conditions (2-D Q, SM) and lateral-inflow forcing (surface + subsurface
-   runoff grids). v1's in-loop cell-wise CREST (`crest_simp.model` inside
-   `generic_domain.evolve`) is retired with the vendored ANUGA.
+3. **Two usable halves, one graph**: CREST-iMAP v2 keeps the CREST water
+   balance (`crest.py`, `model.py`) AND the hydrodynamic solver, so a
+   downloaded copy is a complete weather-driven flood model — precipitation
+   + PET in, inundation out (`CRESTiMAP.run`). v1's cell-wise CREST
+   (`crest_simp.model`, the VIC-curve one-layer soil) is ported from Cython
+   to vectorized, differentiable PyTorch (`crest_step`) rather than retired;
+   only the vendored ANUGA solver is gone. In the **CREST-AI real-time
+   deployment** the CREST balance is instead computed UPSTREAM by EF5, which
+   streams initial conditions (2-D Q, SM) and lateral-inflow forcing
+   (surface + subsurface runoff grids) into `run_event`; that path simply
+   skips the in-module CREST — it is a deployment wiring choice, not a
+   removed capability. Because both halves are pure torch, autograd reaches
+   the CREST soil parameters (WM, B, IM, KE, Ksat) and the Manning field in
+   one backward pass, so the whole coupled model calibrates by gradient.
+
+   *Fork strategy.* This repo (`mchen15ouedu/CREST-iMAP`, branch `v2`) is
+   the full model for general users. If a hydrodynamics-only build is ever
+   wanted for CREST-AI (to shave the CREST import/'`model.py`' surface off
+   the worker image), it lives in a SEPARATE fork — the public model stays
+   whole.
 
 ## Numerical scheme
 

@@ -142,10 +142,48 @@ def test_gradients_match_fd():
         assert rel < 1e-4, f"{name}: autograd {g_auto:.6e} vs FD {g_fd:.6e} (rel {rel:.2e})"
 
 
+def test_basin_mask_sink_and_balance():
+    """Basin domain (active mask): (a) lake at rest inside an irregular
+    basin stays at rest and NO water ever appears outside it; (b) with a
+    high divide (mask boundary on dry, high ground) mass inside is exactly
+    conserved — the sink only acts where water actually leaves; (c) water
+    placed outside the basin is removed on the first step."""
+    ny, nx = 30, 40
+    z = _bumpy_bed(ny, nx, amp=0.3)
+    yy, xx = torch.meshgrid(torch.arange(ny, dtype=torch.get_default_dtype()),
+                            torch.arange(nx, dtype=torch.get_default_dtype()),
+                            indexing="ij")
+    basin = ((xx - nx / 2) / (0.4 * nx)) ** 2 + ((yy - ny / 2) / (0.4 * ny)) ** 2 <= 1.0
+    # ring of high ground just outside the basin (the divide)
+    z = torch.where(basin, z, z + 5.0)
+    eta0 = 1.0
+    h = torch.where(basin, torch.clamp(eta0 - z, min=0.0), torch.zeros_like(z))
+    s = SWESolver(z, dx=2.0, dy=2.0, order=2, bc="open", active=basin)
+    h2, qx2, qy2 = s.run(h.clone(), torch.zeros_like(h), torch.zeros_like(h),
+                         t_end=5.0)
+    assert h2[~basin].abs().max().item() == 0.0, "water outside the basin"
+    assert ((h2 + z) - eta0)[basin & (h > 0)].abs().max().item() < 1e-12
+    assert max(qx2.abs().max().item(), qy2.abs().max().item()) < 1e-12
+    # (b) inflow inside the basin, divide keeps it in: exact conservation
+    rate = torch.where(basin, torch.full_like(z, 1e-4), torch.zeros_like(z))
+    v0 = h.sum().item() * 4.0
+    h3, _, _ = s.run(h.clone(), torch.zeros_like(h), torch.zeros_like(h),
+                     t_end=20.0, rain_fn=lambda t: rate)
+    v_in = rate.sum().item() * 20.0 * 4.0
+    v1 = h3.sum().item() * 4.0
+    assert abs((v1 - v0) - v_in) / v_in < 1e-10, \
+        f"masked mass error {(v1 - v0) - v_in:.3e} of {v_in:.3e}"
+    # (c) water outside is sunk immediately
+    hx = h.clone()
+    hx[0, 0] = 3.0
+    h4, _, _, _ = s.step(hx, torch.zeros_like(h), torch.zeros_like(h), dt=0.01)
+    assert h4[0, 0].item() == 0.0
+
+
 if __name__ == "__main__":
     for fn in (test_well_balanced_wet, test_well_balanced_dry_hills,
                test_stoker_dambreak, test_mass_conservation_with_inflow,
-               test_gradients_match_fd):
+               test_gradients_match_fd, test_basin_mask_sink_and_balance):
         fn()
         print(f"PASS  {fn.__name__}")
     print("all tests passed")

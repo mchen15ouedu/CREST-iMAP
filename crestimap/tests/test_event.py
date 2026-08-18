@@ -40,8 +40,26 @@ def test_tile_naming():
     assert set(ts2) == {"n35w099", "n35w098", "n36w099", "n36w098"}
 
 
+def write_synthetic_domain(d, ny, nx, tr, n_units=2):
+    """Basin-shaped test domain: an ellipse over the valley (the channel row
+    is inside), split into `n_units` HUC-like units along x. Written as
+    domain_huc.tif exactly like hf_data/hucdomain.py does for real events."""
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    ell = ((xx - nx / 2) / (0.48 * nx)) ** 2 + ((yy - ny / 2) / (0.42 * ny)) ** 2 <= 1.0
+    lab = np.full((ny, nx), -1, dtype=np.int16)
+    for k in range(n_units):
+        sel = ell & (xx >= k * nx / n_units) & (xx < (k + 1) * nx / n_units)
+        lab[sel] = k
+    with rasterio.open(str(d / "domain_huc.tif"), "w", driver="GTiff",
+                       height=ny, width=nx, count=1, dtype="int16",
+                       crs="EPSG:4326", transform=tr, nodata=-1) as ds:
+        ds.write(lab, 1)
+    return lab
+
+
 def _synthetic_event_dir(d):
-    """Valley DEM (1/3 of 3" res = 1" cells here for speed) + EF5 grids."""
+    """Valley DEM (1/3 of 3" res = 1" cells here for speed) + EF5 grids
+    + basin domain raster."""
     # DEM at 1 arc-sec (3x refinement of the 3" EF5 grid): tilted valley
     ny, nx = NYC * 3, NXC * 3
     tr = from_origin(W, N, SEC3 / 3, SEC3 / 3)
@@ -53,6 +71,7 @@ def _synthetic_event_dir(d):
                        count=1, dtype="float32", crs="EPSG:4326",
                        transform=tr) as ds:
         ds.write(z.astype(np.float32), 1)
+    write_synthetic_domain(d, ny, nx, tr)
     # EF5 grids at 3"
     tre = from_origin(W, N, SEC3, SEC3)
     rng = np.random.default_rng(3)
@@ -107,15 +126,41 @@ def test_run_event_end_to_end():
         # frames are compact (storage budget: uint16+deflate)
         biggest = max((out / fr["file"]).stat().st_size for fr in man["frames"])
         assert biggest < 200_000, f"frame unexpectedly large: {biggest} B"
+        # BASIN, not rectangle: no water anywhere outside the domain raster
+        assert man["domain"] and man["domain"]["n_units"] == 2
+        with rasterio.open(str(d / "domain_huc.tif")) as ds:
+            lab = ds.read(1)
+        assert md[lab < 0].max() == 0.0, "water outside the basin domain"
+        assert any("basin domain" in s for s in log)
         # channel pre-wet happened
         assert any("channel pre-wet" in s for s in log)
+
+
+def test_run_event_refuses_rectangle():
+    """No domain raster in the bundle -> error, never a rectangular run."""
+    with tempfile.TemporaryDirectory() as td:
+        d = pathlib.Path(td)
+        dem_path = _synthetic_event_dir(d)
+        os.remove(str(d / "domain_huc.tif"))
+        cfg = EventConfig(
+            event_id="test_box", bbox=(W, N - NYC * SEC3, W + NXC * SEC3, N),
+            t0=T0, t_end=T0 + datetime.timedelta(minutes=30),
+            ef5_output_dir=str(d), out_dir=str(d / "o"), model="crest",
+            sim_start=T0, dem_path=dem_path, device=DEVICE)
+        try:
+            run_event(cfg)
+        except FileNotFoundError as e:
+            assert "rectangle" in str(e)
+        else:
+            raise AssertionError("run_event ran without a basin domain")
 
 
 if __name__ == "__main__":
     if rasterio is None:
         print("SKIP: rasterio not available")
         sys.exit(0)
-    for fn in (test_tile_naming, test_run_event_end_to_end):
+    for fn in (test_tile_naming, test_run_event_end_to_end,
+               test_run_event_refuses_rectangle):
         fn()
         print(f"PASS  {fn.__name__}")
     print("all event tests passed")

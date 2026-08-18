@@ -82,6 +82,14 @@ class EventSession:
         self.log(f"solver grid {ny}x{nx} ({ny * nx / 1e3:.0f}k cells, "
                  f"dx~{grid.dx:.0f} m)")
         self._write_dem = _write_dem
+        # basin domain (hydrologic units) — the solver integrates ONLY these
+        # cells; the raster outside them is a sink. Loaded once per session
+        # from the first bundle's domain_huc.tif; kept on CPU, moved with
+        # the state in chunk().
+        from .event import setup_domain
+        os.makedirs(cfg.out_dir, exist_ok=True)
+        self.active, self.labels, self.domain_info = setup_domain(
+            cfg, grid, self.log)
 
         # epoch: absolute datetime of sim t=0 for the WHOLE episode. Every
         # visit counts sim-seconds from here, so frame timestamps and the
@@ -151,6 +159,9 @@ class EventSession:
                      f"rest — skipping {(t_i - self.epoch).total_seconds() / 3600:.0f} h "
                      f"of anchored re-solve)")
 
+        if self.active is not None:           # pre-wet/resume obey the basin
+            h0 = torch.where(self.active.to(h0.device), h0,
+                             torch.zeros_like(h0))
         self.h = h0
         self.qx = torch.zeros_like(h0)
         self.qy = torch.zeros_like(h0)
@@ -172,6 +183,13 @@ class EventSession:
         assert self.visit is None, "previous visit not ended"
         os.makedirs(out_dir, exist_ok=True)
         self._write_dem(os.path.join(out_dir, "dem.tif"), self.grid)
+        gj = (self.domain_info or {}).get("_geojson_src")
+        if gj and os.path.exists(gj):
+            import shutil
+            try:
+                shutil.copy(gj, os.path.join(out_dir, os.path.basename(gj)))
+            except OSError:
+                pass
         t0_rel = (t0 - self.epoch).total_seconds()
         t_end_rel = (t_end - self.epoch).total_seconds()
         if t_end_rel <= self.t + 1e-6:
@@ -235,7 +253,9 @@ class EventSession:
 
         z_d = grid.z.to(device)
         solver = SWESolver(z_d, dx=grid.dx, dy=grid.dy,
-                           n_manning=cfg.n_manning, order=2, bc="open")
+                           n_manning=cfg.n_manning, order=2, bc="open",
+                           active=(self.active.to(device)
+                                   if self.active is not None else None))
         rain = ef5_forcing(v["forcing_dir"], grid, self.epoch,
                            model=cfg.model, dtype=torch.float32,
                            device=device)
@@ -254,6 +274,7 @@ class EventSession:
         md = self.maxdepth.to(device)
         if nudge is not None and not self._nudged_once:
             h = nudge(self.t, h)              # channel water present at start
+            h, qx, qy = solver.mask_state(h, qx, qy)
             self._nudged_once = True
 
         state = {"md": md}
@@ -296,8 +317,10 @@ class EventSession:
         ny, nx = grid.z.shape
         iomod.write_depth(os.path.join(v["out_dir"], "maxdepth.tif"),
                           self.maxdepth.numpy(), grid.transform, grid.crs)
+        from .event import domain_manifest
         manifest = {
             "event_id": cfg.event_id, "bbox": list(cfg.bbox),
+            "domain": domain_manifest(self.domain_info),
             "t0": v["t0"].strftime("%Y-%m-%dT%H:%MZ"),
             "sim_start": v["start"].strftime("%Y-%m-%dT%H:%MZ"),
             "t_end": v["t_end"].strftime("%Y-%m-%dT%H:%MZ"),

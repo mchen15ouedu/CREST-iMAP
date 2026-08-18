@@ -54,6 +54,15 @@ def _synthetic_dir(d, seed=3, channel_row=None, hours=8):
                        count=1, dtype="float32", crs="EPSG:4326",
                        transform=tr) as ds:
         ds.write(z.astype(np.float32), 1)
+    # basin-shaped domain (ellipse over the valley, 2 units) — sessions
+    # refuse to run without one
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    ell = ((xx - nx / 2) / (0.48 * nx)) ** 2 + ((yy - ny / 2) / (0.42 * ny)) ** 2 <= 1.0
+    lab = np.where(ell, (xx >= nx / 2).astype(np.int16), np.int16(-1))
+    with rasterio.open(str(d / "domain_huc.tif"), "w", driver="GTiff",
+                       height=ny, width=nx, count=1, dtype="int16",
+                       crs="EPSG:4326", transform=tr, nodata=-1) as ds:
+        ds.write(lab.astype(np.int16), 1)
     tre = from_origin(W, N, SEC3, SEC3)
     rng = np.random.default_rng(seed)
     row = channel_row if channel_row is not None else NYC // 2

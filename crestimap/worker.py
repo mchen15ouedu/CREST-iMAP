@@ -68,10 +68,15 @@ def _load_token() -> str:
 
 
 def expected_cells(spec: dict) -> int:
-    """Native-resolution cell count of the FULL-BASIN domain — the pre-claim
-    capacity check. This is what keeps `dem.load_dem`'s silent block-mean
-    path (resolution coarsening) from ever engaging: an oversized job is
-    simply never claimed and falls through the ladder to the CPU window."""
+    """Native-resolution cell count of the basin domain's RASTER (the memory
+    footprint: the solver holds the union's bounding raster, integrating
+    the basin cells and sinking the rest) — the pre-claim capacity check.
+    This is what keeps `dem.load_dem`'s silent block-mean path (resolution
+    coarsening) from ever engaging: an oversized job is simply never
+    claimed. The tiled tier (crestimap.tiled) counts per-unit tiles instead."""
+    dom = spec.get("domain") or {}
+    if dom.get("n_bbox"):
+        return int(dom["n_bbox"])
     w, s, e, n = spec["bbox_basin"]
     res = DEM_RES_DEG.get(str(spec.get("dem_res", "1")), DEM_RES_DEG["1"])
     return int(round((n - s) / res)) * int(round((e - w) / res))
@@ -179,6 +184,13 @@ class Worker:
                 continue
             if (ev, spec.get("queued", "")) in self.done:
                 continue                       # this episode already ran
+            if not spec.get("domain"):
+                # pre-basin bundle (rectangular window era): never solved
+                # as a rectangle — the runner re-enqueues it with a HUC12
+                # basin domain
+                _log(f"skip {ev}: no basin domain in spec (pre-basin "
+                     f"bundle) — waiting for its re-enqueue")
+                continue
             cells = expected_cells(spec)
             if cells > self.max_cells:
                 _log(f"skip {ev}: {cells / 1e6:.1f} M cells at native "
@@ -268,6 +280,10 @@ class Worker:
             manifest["hydro"] = spec.get("hydro") or []
             manifest["status"] = "active"
             manifest["basin"] = spec.get("basin")
+            manifest["huc12s"] = spec.get("huc12s")
+            manifest["domain"] = {**{k: v for k, v in (spec.get("domain") or {}).items()
+                                     if k != "hucs"},
+                                  **(manifest.get("domain") or {})}
             eventsim._update_archive(cfg.out_dir, manifest,
                                      lambda s: _log(f"{ev}: {s}"))
             if not manifest.get("archive_frames"):
@@ -408,6 +424,10 @@ class Worker:
             manifest["hydro"] = spec.get("hydro") or []
             manifest["status"] = "active"
             manifest["basin"] = spec.get("basin")
+            manifest["huc12s"] = spec.get("huc12s")
+            manifest["domain"] = {**{k: v for k, v in (spec.get("domain") or {}).items()
+                                     if k != "hucs"},
+                                  **(manifest.get("domain") or {})}
             eventsim._update_archive(out_dir, manifest,
                                      lambda s: _log(f"{ev}: {s}"))
             if not manifest.get("archive_frames"):

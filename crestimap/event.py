@@ -4,12 +4,15 @@ Trigger flow (CREST-AI side, hf_data/eventsim.py):
 
  1. The hourly nowcast risk layer flags gauges at tier 3 ("flood": next-6-h
     AI peak >= Q5); hotspot clusters pick the trigger gauges.
- 2. The event domain is the triggered basin's bbox; EF5 runs the window
-    [t0 - hindcast, t0 + horizon] in nowcast mode (upstream obs + DI-LSTM
-    injection) with output_grids=streamflow|runoff|subrunoff.
+ 2. The event domain is the BASIN contributing to the trigger gauge — the
+    union of WBD HUC12 units (hf_data/hucdomain.py), shipped in the bundle
+    as domain_huc.tif; `bbox` is only the raster extent of that union. EF5
+    runs [t0 - hindcast, t0 + horizon] in nowcast mode (upstream obs +
+    DI-LSTM injection) with output_grids=streamflow|runoff|subrunoff.
  3. run_event() below: 3DEP DEM (fetched on demand, no HF archive),
     EF5 runoff grids as lateral inflow, channel pre-wetting from the 2-D Q
-    grid, well-balanced solver integration, compact depth frames out.
+    grid, well-balanced solver integration on the basin cells only (the
+    rest of the raster is a sink), compact depth frames out.
  4. The caller publishes cfg.out_dir as ONE batched commit (eventstore).
 """
 from __future__ import annotations
@@ -41,6 +44,43 @@ class EventConfig:
     device: str = "cpu"
     dt_every: int = 1                   # CFL recompute cadence (GPU: ~10)
     progress: object = None             # optional callable(str)
+    domain_path: str = None             # basin label raster; default
+                                        # <ef5_output_dir>/domain_huc.tif
+    require_domain: bool = True         # no basin raster -> error, never a
+                                        # rectangular run (tests set False)
+
+
+def setup_domain(cfg: EventConfig, grid, say=lambda s: None):
+    """(active mask tensor | None, labels | None, info dict). Copies the
+    domain geojson next to the results so it publishes with the event."""
+    import shutil
+    from . import domain as dommod
+    p = dommod.find_domain(cfg.ef5_output_dir, cfg.domain_path)
+    if p is None:
+        if cfg.require_domain:
+            raise FileNotFoundError(
+                f"no {dommod.DOMAIN_FILE} in {cfg.ef5_output_dir}: the "
+                f"event has no basin domain and a rectangle is not allowed")
+        say("WARNING: no basin domain raster — whole raster integrated "
+            "(synthetic/test run only)")
+        return None, None, {}
+    active, labels, info = dommod.load_domain(p, grid, device=grid.z.device)
+    say(f"basin domain: {info['n_units']} unit(s), {info['n_active'] / 1e3:.0f}k "
+        f"active cells = {100 * info['active_frac']:.0f}% of the "
+        f"{info['n_bbox'] / 1e3:.0f}k-cell raster (rest is a sink)")
+    gj = os.path.join(os.path.dirname(p), dommod.GEOJSON_FILE)
+    if os.path.exists(gj):
+        info["geojson"] = dommod.GEOJSON_FILE
+        info["_geojson_src"] = gj          # sessions re-copy per visit dir
+        try:
+            shutil.copy(gj, os.path.join(cfg.out_dir, dommod.GEOJSON_FILE))
+        except OSError:
+            pass
+    return active, labels, info
+
+
+def domain_manifest(info: dict | None):
+    return {k: v for k, v in (info or {}).items() if not k.startswith("_")} or None
 
 
 def run_event(cfg: EventConfig) -> dict:
@@ -76,6 +116,7 @@ def run_event(cfg: EventConfig) -> dict:
         f"dx~{grid.dx:.0f} m)")
     iomod_dem = os.path.join(cfg.out_dir, "dem.tif")
     _write_dem(iomod_dem, grid)
+    active, _labels, dom_info = setup_domain(cfg, grid, say)
 
     # ---- forcing + initial conditions ----------------------------------- #
     sim_start = cfg.sim_start or (cfg.t0 - datetime.timedelta(hours=6))
@@ -164,8 +205,9 @@ def run_event(cfg: EventConfig) -> dict:
 
     # ---- integrate ------------------------------------------------------ #
     solver = SWESolver(grid.z, dx=grid.dx, dy=grid.dy, n_manning=cfg.n_manning,
-                       order=2, bc="open")
+                       order=2, bc="open", active=active)
     t_total = (cfg.t_end - sim_start).total_seconds()
+    h0, qx0, qy0 = solver.mask_state(h0, qx0, qy0)   # pre-wet obeys the basin
     maxdepth = h0.clone()
     frames = []
     state = {"next": cfg.output_every_s}
@@ -187,6 +229,7 @@ def run_event(cfg: EventConfig) -> dict:
         f"({sim_start:%m-%d %H:%M} -> {cfg.t_end:%m-%d %H:%M} UTC)")
     if nudge is not None:
         h0 = nudge(0.0, h0)               # channel water present from t=0
+        h0, qx0, qy0 = solver.mask_state(h0, qx0, qy0)
     solver.run(h0, qx0, qy0, t_end=t_total, rain_fn=rain, callback=cb,
                nudge_fn=nudge, dt_every=cfg.dt_every)
 
@@ -194,6 +237,7 @@ def run_event(cfg: EventConfig) -> dict:
                       maxdepth.detach().cpu().numpy(), grid.transform, grid.crs)
     manifest = {
         "event_id": cfg.event_id, "bbox": list(cfg.bbox),
+        "domain": domain_manifest(dom_info),
         "t0": cfg.t0.strftime("%Y-%m-%dT%H:%MZ"),
         "sim_start": sim_start.strftime("%Y-%m-%dT%H:%MZ"),
         "t_end": cfg.t_end.strftime("%Y-%m-%dT%H:%MZ"),

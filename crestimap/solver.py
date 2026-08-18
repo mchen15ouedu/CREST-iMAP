@@ -25,6 +25,7 @@ conditions, and forcing.
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 G_DEFAULT = 9.80665
@@ -52,10 +53,15 @@ class SWESolver:
     order : 1 (robust, diffusive) or 2 (MUSCL/minmod, default).
     bc : 'wall' (reflective) or 'open' (zero-gradient outflow).
     eps : wet/dry desingularization depth [m].
+    active : optional bool (ny, nx) tensor — the BASIN. Cells outside it are
+        sinks: their state is forced to zero after every step, so water
+        leaving through the pour point vanishes (free outflow) and nothing
+        is ever simulated outside the hydrologic unit. None = whole raster
+        (rectangular domain — only for synthetic tests).
     """
 
     def __init__(self, z, dx, dy, n_manning=0.03, g=G_DEFAULT, eps=1e-6,
-                 cfl=0.45, order=2, bc="wall", dt_max=60.0):
+                 cfl=0.45, order=2, bc="wall", dt_max=60.0, active=None):
         self.z = z if torch.is_tensor(z) else torch.as_tensor(z, dtype=torch.get_default_dtype())
         self.dtype = self.z.dtype
         self.device = self.z.device
@@ -71,6 +77,13 @@ class SWESolver:
         assert bc in ("wall", "open")
         self.bc = bc
         self.dt_max = dt_max
+        if active is not None:
+            active = active if torch.is_tensor(active) else torch.as_tensor(
+                np.asarray(active))
+            active = active.to(device=self.device, dtype=torch.bool)
+            assert active.shape == self.z.shape, "active mask must match z"
+        self.active = active
+        self._zero = None
 
     # ------------------------------------------------------------------ #
     # boundary handling
@@ -283,7 +296,17 @@ class SWESolver:
         dry = hn <= self.eps
         qxn = torch.where(dry, torch.zeros_like(qxn), qxn)
         qyn = torch.where(dry, torch.zeros_like(qyn), qyn)
-        return hn, qxn, qyn, dt
+        return self.mask_state(hn, qxn, qyn) + (dt,)
+
+    def mask_state(self, h, qx, qy):
+        """Sink everything outside the basin (no-op without a mask)."""
+        if self.active is None:
+            return h, qx, qy
+        if self._zero is None or self._zero.device != h.device:
+            self._zero = torch.zeros((), dtype=h.dtype, device=h.device)
+        return (torch.where(self.active, h, self._zero),
+                torch.where(self.active, qx, self._zero),
+                torch.where(self.active, qy, self._zero))
 
     def run(self, h, qx, qy, t_end, rain_fn=None, t0=0.0, callback=None,
             checkpoint_every=0, nudge_fn=None, dt_every=1):
@@ -332,6 +355,8 @@ class SWESolver:
             nstep += 1
             if nudge_fn is not None:
                 h = nudge_fn(t, h)
+                if self.active is not None:     # channel floor obeys the basin
+                    h, qx, qy = self.mask_state(h, qx, qy)
             if callback is not None:
                 callback(t, h, qx, qy)
         return h, qx, qy

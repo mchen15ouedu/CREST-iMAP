@@ -27,9 +27,14 @@ python -m crestimap.worker --sessions --publish --device cuda:0 \
 
 Re-sync `space_ref` (hf_data now has `hucdomain.py`, `eventsim.py` with the
 basin domain, `eventstore.py` with `domain` in the index summary) and
-`git pull` the fork **at the job boundary**. Old queued bundles (no `domain`
-in the spec) are skipped by the new worker; the runner re-enqueues every
-listed event with a basin domain (in progress on the Space side).
+`git pull` the fork (≥ 2e210d2b) **at the job boundary — before claiming
+another job**: an OLD worker on a NEW spec would solve the union's bounding
+rectangle (it ignores `domain_huc.tif`), which is exactly what must never
+be published again. Old queued bundles (no `domain` in the spec) are
+skipped by the new worker. The runner has re-enqueued every listed event
+with a basin domain and a `cold` stamp (spec `cold: <ISO>`): the worker
+drops any resident session for that episode and re-solves the whole
+anchored span from the channel pre-wet, so no box-era frame survives.
 
 ## Validation asked of the HPC
 

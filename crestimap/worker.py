@@ -384,8 +384,10 @@ class Worker:
         spec = job["spec"]
         queued = spec.get("queued", "")
         rec = self.sessions.get(ev)
-        if rec and rec["bbox"] != spec["bbox_basin"]:
-            _log(f"{ev}: bbox changed — dropping resident session")
+        if rec and (rec["bbox"] != spec["bbox_basin"]
+                    or rec.get("cold") != spec.get("cold")):
+            _log(f"{ev}: {'cold re-run requested' if rec.get('cold') != spec.get('cold') else 'bbox changed'}"
+                 f" — dropping resident session")
             shutil.rmtree(rec["root"], ignore_errors=True)
             self.sessions.pop(ev, None)
             rec = None
@@ -394,8 +396,8 @@ class Worker:
             root = tempfile.mkdtemp(prefix=f"sess_{ev}_",
                                     dir=self.args.work_root)
             rec = {"session": None, "root": root,
-                   "bbox": spec["bbox_basin"], "visits": 0,
-                   "last": time.time()}
+                   "bbox": spec["bbox_basin"], "cold": spec.get("cold"),
+                   "visits": 0, "last": time.time()}
         n = rec["visits"] + 1
         forcing_dir = os.path.join(rec["root"], f"forcing_{n}")
         out_dir = os.path.join(rec["root"], f"out_{n}")

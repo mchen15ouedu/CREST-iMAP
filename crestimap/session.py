@@ -251,6 +251,12 @@ class EventSession:
         if v["snapshot"] is None:
             t_hi = min(t_hi, v["t0_rel"])     # land exactly on the junction
 
+        # parallel tier: HUC12 units tiled across several devices when the
+        # config names them (crestimap.tiled) — same physics, owned cells
+        # bit-identical to the single-device masked solve
+        devs = [str(d) for d in (cfg.devices or ())] or [device]
+        n_tiles = int(cfg.n_tiles or 0) or len(devs)
+        use_tiled = self.labels is not None and (len(devs) > 1 or n_tiles > 1)
         z_d = grid.z.to(device)
         solver = SWESolver(z_d, dx=grid.dx, dy=grid.dy,
                            n_manning=cfg.n_manning, order=2, bc="open",
@@ -279,24 +285,46 @@ class EventSession:
 
         state = {"md": md}
 
+        def frame_due(t):
+            return t + 1e-6 >= v["next_frame"] or t >= v["t_end_rel"] - 1e-6
+
+        def write_frame(t, h_cpu):
+            when = self.epoch + datetime.timedelta(seconds=round(t))
+            fname = f"depth_{when:%Y%m%d%H%M}.tif"
+            iomod.write_depth(os.path.join(v["out_dir"], fname),
+                              h_cpu.numpy(), grid.transform, grid.crs)
+            v["frames"].append({"t": when.strftime("%Y-%m-%dT%H:%MZ"),
+                                "file": fname})
+            self.log(f"frame {fname} (sim t={t / 3600:.2f} h)")
+            while v["next_frame"] <= t + 1e-6:
+                v["next_frame"] += cfg.output_every_s
+
         def cb(t, h_, qx_, qy_):
             state["md"] = torch.maximum(state["md"], h_)
-            if t + 1e-6 >= v["next_frame"] or t >= v["t_end_rel"] - 1e-6:
-                when = self.epoch + datetime.timedelta(seconds=round(t))
-                fname = f"depth_{when:%Y%m%d%H%M}.tif"
-                iomod.write_depth(os.path.join(v["out_dir"], fname),
-                                  h_.detach().cpu().numpy(),
-                                  grid.transform, grid.crs)
-                v["frames"].append({"t": when.strftime("%Y-%m-%dT%H:%MZ"),
-                                    "file": fname})
-                self.log(f"frame {fname} (sim t={t / 3600:.2f} h)")
-                while v["next_frame"] <= t + 1e-6:
-                    v["next_frame"] += cfg.output_every_s
+            if frame_due(t):
+                write_frame(t, h_.detach().cpu())
+
+        def cb_tiled(t, ts):
+            if frame_due(t):                  # gather only when a frame is due
+                write_frame(t, ts.gather_h())
 
         if t_hi > self.t + 1e-9:
-            h, qx, qy = solver.run(h, qx, qy, t_end=t_hi, rain_fn=rain,
-                                   t0=self.t, callback=cb, nudge_fn=nudge,
-                                   dt_every=cfg.dt_every)
+            if use_tiled:
+                from .tiled import TiledSolver
+                ts = TiledSolver(grid.z, self.labels, dx=grid.dx, dy=grid.dy,
+                                 devices=devs, n_manning=cfg.n_manning,
+                                 n_tiles=n_tiles, order=2, bc="open",
+                                 log=self.log)
+                ts.scatter(h.cpu(), qx.cpu(), qy.cpu(), md.cpu())
+                ts.run(t_end=t_hi, rain_fn=rain, t0=self.t, callback=cb_tiled,
+                       nudge_fn=nudge, dt_every=cfg.dt_every)
+                h, qx, qy = ts.gather()
+                state["md"] = ts.gather_maxdepth()
+                del ts
+            else:
+                h, qx, qy = solver.run(h, qx, qy, t_end=t_hi, rain_fn=rain,
+                                       t0=self.t, callback=cb, nudge_fn=nudge,
+                                       dt_every=cfg.dt_every)
         self.h, self.qx, self.qy = h.cpu(), qx.cpu(), qy.cpu()
         self.maxdepth = state["md"].cpu()
         self.t = t_hi

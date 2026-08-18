@@ -67,14 +67,20 @@ def _load_token() -> str:
     return tok
 
 
-def expected_cells(spec: dict) -> int:
-    """Native-resolution cell count of the basin domain's RASTER (the memory
-    footprint: the solver holds the union's bounding raster, integrating
-    the basin cells and sinking the rest) — the pre-claim capacity check.
-    This is what keeps `dem.load_dem`'s silent block-mean path (resolution
-    coarsening) from ever engaging: an oversized job is simply never
-    claimed. The tiled tier (crestimap.tiled) counts per-unit tiles instead."""
+TILE_RECT_FACTOR = 1.6      # tile rect cells per owned cell (measured 1.3-1.6)
+
+
+def expected_cells(spec: dict, n_devices: int = 1) -> int:
+    """Per-device raster cells the job needs at native resolution — the
+    pre-claim capacity check against --max-cells. Single device: the basin
+    union's bounding raster (the solver holds it whole, integrating basin
+    cells and sinking the rest). Tiled across n_devices: the basin's ACTIVE
+    cells split n ways times the tile-rect overhead. This is what keeps
+    `dem.load_dem`'s silent block-mean path (resolution coarsening) from
+    ever engaging: an oversized job is simply never claimed."""
     dom = spec.get("domain") or {}
+    if n_devices > 1 and dom.get("n_active"):
+        return int(dom["n_active"] * TILE_RECT_FACTOR / n_devices)
     if dom.get("n_bbox"):
         return int(dom["n_bbox"])
     w, s, e, n = spec["bbox_basin"]
@@ -93,6 +99,9 @@ class Worker:
         # V30 provenance: publish_event stamps the manifest with this
         os.environ.setdefault("EVENT_ENGINE_IDENT", f"hpc:{self.ident}")
         self.max_cells = args.max_cells
+        self.devices = tuple(d.strip() for d in (getattr(args, "devices", "")
+                                                 or "").split(",") if d.strip())
+        self.n_tiles = int(getattr(args, "tiles", 0) or 0)
         self.publish = args.publish
         # (event_id, queued) pairs already processed this session. With
         # --no-publish the queue entry is never consumed (the Space owns it),
@@ -191,11 +200,11 @@ class Worker:
                 _log(f"skip {ev}: no basin domain in spec (pre-basin "
                      f"bundle) — waiting for its re-enqueue")
                 continue
-            cells = expected_cells(spec)
+            cells = expected_cells(spec, max(1, len(self.devices)))
             if cells > self.max_cells:
-                _log(f"skip {ev}: {cells / 1e6:.1f} M cells at native "
-                     f"res exceeds the {self.max_cells / 1e6:.0f} M budget "
-                     f"(falls through to the CPU window; never coarsened)")
+                _log(f"skip {ev}: {cells / 1e6:.1f} M cells per device at "
+                     f"native res exceeds the {self.max_cells / 1e6:.0f} M "
+                     f"budget (never coarsened; needs more devices)")
                 continue
             if f"{QPREFIX}/{ev}.claim" in qf:
                 claim = self._read_json(f"{QPREFIX}/{ev}.claim")
@@ -271,6 +280,7 @@ class Worker:
                 dem_cache=os.environ["EVENT_DEM_CACHE"],
                 max_cells=self.max_cells,
                 trigger=spec.get("trigger"), device=self.args.device,
+                devices=self.devices or None, n_tiles=self.n_tiles,
                 dt_every=self.args.dt_every,
                 progress=lambda s: _log(f"{ev}: {s}"))
             manifest = run_event(cfg)
@@ -413,6 +423,7 @@ class Worker:
                     dem_cache=os.environ["EVENT_DEM_CACHE"],
                     max_cells=self.max_cells,
                     trigger=spec.get("trigger"), device=self.args.device,
+                    devices=self.devices or None, n_tiles=self.n_tiles,
                     dt_every=self.args.dt_every,
                     progress=lambda s: _log(f"{ev}: {s}"))
                 rec["session"] = EventSession(cfg, resume=True)
@@ -572,9 +583,20 @@ def main(argv=None):
         os.path.join("/media/scratch", os.environ.get("USER", "worker"),
                      "crest_worker", "jobs")))
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--devices", default=os.environ.get("EVENT_DEVICES", ""),
+                    help="parallel tier: comma list, e.g. cuda:0,cuda:1,cuda:2 "
+                         "— the basin's HUC12 units are tiled across them "
+                         "(crestimap.tiled, halo exchange only where units "
+                         "touch). Empty = single device (--device)")
+    ap.add_argument("--tiles", type=int,
+                    default=int(os.environ.get("EVENT_TILES", "0")),
+                    help="force a tile count (0 = one per device)")
     ap.add_argument("--max-cells", type=int,
                     default=int(os.environ.get("EVENT_MAX_CELLS_GPU",
-                                               "100000000")))
+                                               "100000000")),
+                    help="per-DEVICE raster budget; with --devices the "
+                         "claimable basin size scales with the device count "
+                         "(tile rects ~1.5x their owned cells)")
     ap.add_argument("--poll-s", type=int, default=60)
     ap.add_argument("--hb-s", type=int, default=240)
     ap.add_argument("--stale-s", type=int, default=600)

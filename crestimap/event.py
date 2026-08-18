@@ -48,6 +48,10 @@ class EventConfig:
                                         # <ef5_output_dir>/domain_huc.tif
     require_domain: bool = True         # no basin raster -> error, never a
                                         # rectangular run (tests set False)
+    devices: tuple = None               # parallel tier: e.g. ("cuda:0",
+                                        # "cuda:1") — HUC12 units tiled across
+                                        # them (crestimap.tiled); None = one
+    n_tiles: int = 0                    # force a tile count (0 = #devices)
 
 
 def setup_domain(cfg: EventConfig, grid, say=lambda s: None):

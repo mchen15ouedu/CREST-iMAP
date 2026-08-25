@@ -26,9 +26,33 @@ conditions, and forcing.
 from __future__ import annotations
 
 import numpy as np
+import math
+
 import torch
 
 G_DEFAULT = 9.80665
+
+
+def speed_sectors(h, qx, qy, min_h=0.05, min_v=0.01):
+    """Per-cell speed [m/s] and 8-sector compass flow direction.
+
+    Velocity = q/h where the cell is wet enough to have meaningful momentum
+    (h >= min_h, default 5 cm); shallower or slower (< min_v m/s) cells get
+    speed 0 / sector 255. Sectors are the compass direction the water moves
+    TOWARD, on a north-up raster (row 0 = north, +qy = southward):
+    0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW. Used by the risk view.
+    """
+    wet = h >= min_h
+    hs = torch.where(wet, h, torch.ones_like(h))
+    ux = torch.where(wet, qx / hs, torch.zeros_like(h))     # +east
+    un = torch.where(wet, -qy / hs, torch.zeros_like(h))    # +north
+    speed = torch.sqrt(ux * ux + un * un)
+    moving = wet & (speed >= min_v)
+    speed = torch.where(moving, speed, torch.zeros_like(speed))
+    bearing = torch.atan2(ux, un)                            # 0 = N, cw +
+    sector = torch.round(bearing / (math.pi / 4.0)).to(torch.int64) % 8
+    return speed, torch.where(moving, sector,
+                              torch.full_like(sector, 255)).to(torch.uint8)
 
 
 def desing_velocity(h: torch.Tensor, q: torch.Tensor, eps: float) -> torch.Tensor:

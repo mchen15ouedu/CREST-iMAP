@@ -213,13 +213,20 @@ def run_event(cfg: EventConfig) -> dict:
     t_total = (cfg.t_end - sim_start).total_seconds()
     h0, qx0, qy0 = solver.mask_state(h0, qx0, qy0)   # pre-wet obeys the basin
     maxdepth = h0.clone()
+    maxspeed = torch.zeros_like(h0)
+    flowdir = torch.full(h0.shape, 255, dtype=torch.uint8, device=h0.device)
     frames = []
     state = {"next": cfg.output_every_s}
 
     def cb(t, h, qx, qy):
-        nonlocal maxdepth
+        nonlocal maxdepth, maxspeed, flowdir
         maxdepth = torch.maximum(maxdepth, h)
         if t + 1e-6 >= state["next"] or t >= t_total - 1e-6:
+            from .solver import speed_sectors
+            sp, sec = speed_sectors(h, qx, qy)   # frame-cadence, like session
+            better = sp > maxspeed
+            maxspeed = torch.where(better, sp, maxspeed)
+            flowdir = torch.where(better, sec, flowdir)
             when = sim_start + datetime.timedelta(seconds=round(t))
             fname = f"depth_{when:%Y%m%d%H%M}.tif"
             iomod.write_depth(os.path.join(cfg.out_dir, fname),
@@ -239,6 +246,10 @@ def run_event(cfg: EventConfig) -> dict:
 
     iomod.write_depth(os.path.join(cfg.out_dir, "maxdepth.tif"),
                       maxdepth.detach().cpu().numpy(), grid.transform, grid.crs)
+    iomod.write_depth(os.path.join(cfg.out_dir, "maxspeed.tif"),
+                      maxspeed.detach().cpu().numpy(), grid.transform, grid.crs)
+    iomod.write_sectors(os.path.join(cfg.out_dir, "flowdir.tif"),
+                        flowdir.detach().cpu().numpy(), grid.transform, grid.crs)
     manifest = {
         "event_id": cfg.event_id, "bbox": list(cfg.bbox),
         "domain": domain_manifest(dom_info),
@@ -251,7 +262,8 @@ def run_event(cfg: EventConfig) -> dict:
                  "transform": list(grid.transform)[:6],
                  "crs": str(grid.crs) if grid.crs else None},
         "n_manning": cfg.n_manning, "frames": frames,
-        "maxdepth": "maxdepth.tif", "dem": "dem.tif",
+        "maxdepth": "maxdepth.tif", "maxspeed": "maxspeed.tif",
+        "flowdir": "flowdir.tif", "dem": "dem.tif",
         "generated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     with open(os.path.join(cfg.out_dir, "manifest.json"), "w") as fp:

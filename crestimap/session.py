@@ -167,6 +167,13 @@ class EventSession:
         self.qy = torch.zeros_like(h0)
         # obs-supported running max — survives tail rollbacks
         self.maxdepth = h0.clone()
+        # risk-view companions to maxdepth, same junction semantics: peak
+        # speed [m/s] and the 8-sector compass direction AT that peak
+        # (sampled at frame cadence; 255 = never flowed). A resume starts
+        # them clean — like momentum, the speed history is not recoverable
+        # from a depth frame.
+        self.maxspeed = torch.zeros_like(h0)
+        self.flowdir = torch.full(h0.shape, 255, dtype=torch.uint8, device=h0.device)
         self.t = (t_state - self.epoch).total_seconds()
         self._nudged_once = False
         self.visit = None                 # active-visit dict, else parked
@@ -232,6 +239,8 @@ class EventSession:
                          self.qx.detach().cpu().clone(),
                          self.qy.detach().cpu().clone(),
                          self.maxdepth.detach().cpu().clone(),
+                         self.maxspeed.detach().cpu().clone(),
+                         self.flowdir.detach().cpu().clone(),
                          self.t)
 
     # ------------------------------------------------------------------ #
@@ -283,7 +292,15 @@ class EventSession:
             h, qx, qy = solver.mask_state(h, qx, qy)
             self._nudged_once = True
 
-        state = {"md": md}
+        state = {"md": md, "ms": self.maxspeed.to(device),
+                 "fd": self.flowdir.to(device)}
+
+        def track_speed(h_, qx_, qy_):
+            from .solver import speed_sectors
+            sp, sec = speed_sectors(h_, qx_, qy_)
+            better = sp > state["ms"]
+            state["ms"] = torch.where(better, sp, state["ms"])
+            state["fd"] = torch.where(better, sec, state["fd"])
 
         def frame_due(t):
             return t + 1e-6 >= v["next_frame"] or t >= v["t_end_rel"] - 1e-6
@@ -302,11 +319,17 @@ class EventSession:
         def cb(t, h_, qx_, qy_):
             state["md"] = torch.maximum(state["md"], h_)
             if frame_due(t):
+                track_speed(h_, qx_, qy_)   # speed sampled at frame cadence
                 write_frame(t, h_.detach().cpu())
 
         def cb_tiled(t, ts):
             if frame_due(t):                  # gather only when a frame is due
-                write_frame(t, ts.gather_h())
+                h_c, qx_c, qy_c = ts.gather()
+                if state["ms"].device.type != "cpu":
+                    state["ms"] = state["ms"].cpu()
+                    state["fd"] = state["fd"].cpu()
+                track_speed(h_c, qx_c, qy_c)
+                write_frame(t, h_c)
 
         if t_hi > self.t + 1e-9:
             if use_tiled:
@@ -327,6 +350,8 @@ class EventSession:
                                        dt_every=cfg.dt_every)
         self.h, self.qx, self.qy = h.cpu(), qx.cpu(), qy.cpu()
         self.maxdepth = state["md"].cpu()
+        self.maxspeed = state["ms"].cpu()
+        self.flowdir = state["fd"].cpu()
         self.t = t_hi
         if v["snapshot"] is None and self.t >= v["t0_rel"] - 1e-6:
             self._take_snapshot()
@@ -345,6 +370,12 @@ class EventSession:
         ny, nx = grid.z.shape
         iomod.write_depth(os.path.join(v["out_dir"], "maxdepth.tif"),
                           self.maxdepth.numpy(), grid.transform, grid.crs)
+        # risk-view rasters: peak speed (cm/s via the depth writer's /100
+        # scaling) and flow direction at that peak
+        iomod.write_depth(os.path.join(v["out_dir"], "maxspeed.tif"),
+                          self.maxspeed.numpy(), grid.transform, grid.crs)
+        iomod.write_sectors(os.path.join(v["out_dir"], "flowdir.tif"),
+                            self.flowdir.numpy(), grid.transform, grid.crs)
         from .event import domain_manifest
         manifest = {
             "event_id": cfg.event_id, "bbox": list(cfg.bbox),
@@ -358,7 +389,8 @@ class EventSession:
                      "transform": list(grid.transform)[:6],
                      "crs": str(grid.crs) if grid.crs else None},
             "n_manning": cfg.n_manning, "frames": v["frames"],
-            "maxdepth": "maxdepth.tif", "dem": "dem.tif",
+            "maxdepth": "maxdepth.tif", "maxspeed": "maxspeed.tif",
+            "flowdir": "flowdir.tif", "dem": "dem.tif",
             "generated": datetime.datetime.utcnow().strftime(
                 "%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -366,7 +398,8 @@ class EventSession:
             json.dump(manifest, fp)
         # roll back to the junction: obs-supported state + maxdepth survive,
         # the tail (and its over/under-predictions) do not
-        self.h, self.qx, self.qy, self.maxdepth, self.t = v["snapshot"]
+        (self.h, self.qx, self.qy, self.maxdepth, self.maxspeed,
+         self.flowdir, self.t) = v["snapshot"]
         self.visit = None
         self.log(f"visit done — {len(manifest['frames'])} frames published; "
                  f"holding state at {self.state_time():%m-%d %H:%M} "
@@ -390,19 +423,21 @@ class EventSession:
         self.qx = self.qx.cpu()
         self.qy = self.qy.cpu()
         self.maxdepth = self.maxdepth.cpu()
+        self.maxspeed = self.maxspeed.cpu()
+        self.flowdir = self.flowdir.cpu()
 
     # ------------------------------------------------------------------ #
     # ZeroGPU fork plumbing: a @spaces.GPU child mutates a pickled COPY of
     # the session, so it must return the state for the parent to reapply.
     def state_tuple(self):
         v = self.visit
-        return (self.h, self.qx, self.qy, self.maxdepth, self.t,
-                self._nudged_once,
+        return (self.h, self.qx, self.qy, self.maxdepth, self.maxspeed,
+                self.flowdir, self.t, self._nudged_once,
                 (v["frames"], v["next_frame"], v["snapshot"]) if v else None)
 
     def set_state(self, tup):
-        (self.h, self.qx, self.qy, self.maxdepth, self.t,
-         self._nudged_once, vt) = tup
+        (self.h, self.qx, self.qy, self.maxdepth, self.maxspeed,
+         self.flowdir, self.t, self._nudged_once, vt) = tup
         if vt is not None and self.visit is not None:
             self.visit["frames"], self.visit["next_frame"], \
                 self.visit["snapshot"] = vt

@@ -4,6 +4,10 @@ Flood-depth fields are mostly dry, so uint16 centimeters + DEFLATE
 compresses to a few percent of float32 — an event's whole frame stack
 lands in the tens of MB instead of GB. Depth precision 1 cm, range
 0–655.35 m.
+
+write_depth doubles as the speed writer (uint16 cm/s, same 1/100 scaling)
+for maxspeed.tif; write_sectors stores the 8-sector flow direction that the
+dashboard's risk view reads (N=0 clockwise to NW=7, 255 = never flowed).
 """
 from __future__ import annotations
 
@@ -18,6 +22,19 @@ def write_depth(path, depth_m, transform, crs):
                        height=q.shape[0], width=q.shape[1], count=1,
                        dtype="uint16", crs=crs, transform=transform,
                        compress="deflate", predictor=2, tiled=True,
+                       blockxsize=256, blockysize=256) as ds:
+        ds.write(q, 1)
+    return path
+
+
+def write_sectors(path, sectors_u8, transform, crs):
+    """8-sector flow-direction raster (0=N,1=NE,...,7=NW; 255=no flow)."""
+    import rasterio
+    q = np.asarray(sectors_u8, dtype=np.uint8)
+    with rasterio.open(path, "w", driver="GTiff",
+                       height=q.shape[0], width=q.shape[1], count=1,
+                       dtype="uint8", crs=crs, transform=transform,
+                       nodata=255, compress="deflate", tiled=True,
                        blockxsize=256, blockysize=256) as ds:
         ds.write(q, 1)
     return path

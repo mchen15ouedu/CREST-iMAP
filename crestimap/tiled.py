@@ -279,7 +279,7 @@ class TiledSolver:
             t.h, t.qx, t.qy = t.solver.mask_state(hn, qxn, qyn)
         self._exchange(("h", "qx", "qy"))
 
-    def run(self, t_end, rain_fn=None, t0=0.0, callback=None, nudge_fn=None,
+    def run(self, t_end, rain_fn=None, t0=0.0, callback=None,
             dt_every=1, track_max=True):
         """Integrate the scattered state to t_end (same contract as
         SWESolver.run; callback(t, self) — use gather_h()/gather_maxdepth()
@@ -289,19 +289,6 @@ class TiledSolver:
         held_dt = None
         next_change = getattr(rain_fn, "next_change", None)
         rain_slices = self._slice_fn(rain_fn)
-        # nudge (EF5ChannelStage) is (t, h) -> max(h, stage(t)) with a global
-        # stage tensor; apply it per tile on the sliced stage
-        stage_cache = {}
-
-        def nudge_tile(tt, tile):
-            st = nudge_fn._stage(nudge_fn._index(tt))
-            key = (id(st), tile.g)
-            if key not in stage_cache:
-                if len(stage_cache) > 4 * len(self.tiles):
-                    stage_cache.clear()
-                stage_cache[key] = st[tile.r0:tile.r1, tile.c0:tile.c1].to(tile.device)
-            return torch.maximum(tile.h, stage_cache[key])
-
         while t < t_end - 1e-12:
             rains = [(lambda f=f, tt=t: f(tt)) if f is not None else None
                      for f in rain_slices]
@@ -319,12 +306,6 @@ class TiledSolver:
             self.step(dt, rains)
             t += dt
             nstep += 1
-            if nudge_fn is not None:
-                for tile in self.tiles:
-                    tile.h = nudge_tile(t, tile)
-                    tile.h, tile.qx, tile.qy = tile.solver.mask_state(
-                        tile.h, tile.qx, tile.qy)
-                self._exchange(("h",))
             if track_max:
                 for tile in self.tiles:
                     tile.md = torch.maximum(tile.md, tile.h)

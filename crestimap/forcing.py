@@ -81,12 +81,22 @@ class GriddedSeriesForcing:
 
 
 def sum_forcings(*fns):
-    """Combine surface-runoff and subsurface-runoff forcings."""
+    """Combine lateral-inflow forcings (surface runoff, subsurface runoff,
+    inlet inflow). The combined tensor is rebuilt only when a component
+    changes (piecewise-constant per hour), so its identity is stable within
+    an hour — TiledSolver's per-tile slice cache keys on id()."""
+    fns = [f for f in fns if f is not None]
+    state = {"key": None, "val": None}
+
     def combined(t):
-        out = fns[0](t)
-        for f in fns[1:]:
-            out = out + f(t)
-        return torch.clamp(out, min=0.0)
+        parts = [f(t) for f in fns]
+        key = tuple(id(p) for p in parts)
+        if key != state["key"]:
+            out = parts[0]
+            for p in parts[1:]:
+                out = out + p
+            state["key"], state["val"] = key, torch.clamp(out, min=0.0)
+        return state["val"]
 
     def next_change(t):
         return min((f.next_change(t) for f in fns if hasattr(f, "next_change")),
@@ -261,85 +271,180 @@ def rating_depth(q, n_ch=0.035, slope=1e-3, width_fn=None):
     return (n_ch * q / (w * slope ** 0.5)) ** 0.6
 
 
-class EF5ChannelStage:
-    """Routed-flood coupling: EF5's hourly 2-D discharge grids -> target
-    water depth along channel cells on the solver grid.
+class EF5InletInflow:
+    """Routed-flow coupling as a BOUNDARY CONDITION.
 
-    Recession floods carry their water in the routed channel network, not in
-    the local runoff grids — without this, an event triggered days after the
-    rain simulates bone-dry. `SWESolver.run(nudge_fn=...)` applies the target
-    as a one-way floor (h := max(h, stage)), and the 2-D solver spreads the
-    overbank water. Piecewise-constant per EF5 grid hour; channel mask is
-    q >= q_min.
+    EF5's hourly discharge grids enter the 2-D domain ONLY where the EF5
+    channel network crosses INTO the active basin — the upstream inlets of a
+    trimmed or partial domain. Inside the basin the shallow-water solver
+    routes CREST's own runoff grids (ef5_forcing); nothing else adds mass, so
+    the map can never hold more water than CREST delivered. A full basin
+    (headwaters included) has no inlets and gets no injection at all.
+
+    History: until 2026-09-22 this coupling was a depth FLOOR applied after
+    every solver step on every solver cell of every EF5 channel pixel
+    (h := max(h, rating_depth(q))). It refilled whatever drained out of a
+    channel cell and manufactured water at the channel conveyance rate for
+    the whole run — published maps held 10x-1000x the event's outflow volume.
+    Never reintroduce a per-step state clamp as a forcing.
+
+    Inlet detection (once, from the network geometry = max q over the
+    series): an EF5 pixel OUTSIDE the active mask with q >= q_min whose
+    largest-q 8-neighbour is INSIDE the mask and carries more flow (flow goes
+    toward larger q, so that neighbour is its downstream cell). Its hourly q
+    is injected as a lateral-inflow rate [m/s] at the lowest active solver
+    cell of that inside pixel (the channel). The pour point is never an
+    inlet: there the outside pixel carries the larger q.
+
+    Callable like ef5_forcing: t_seconds -> (ny, nx) tensor [m/s],
+    piecewise-constant per EF5 hour, plus next_change(t).
     """
 
-    def __init__(self, output_dir, grid, t0, model=None, q_min=5.0,
-                 cap_m=8.0, method="containing", dtype=None, device=None):
+    def __init__(self, output_dir, grid, t0, active=None, model=None,
+                 q_min=5.0, dtype=None, device=None):
+        import rasterio
         self.series = parse_ef5_dir(output_dir, "q", model)
         if not self.series:
             raise FileNotFoundError(f"no 'q.*.tif' grids in {output_dir}")
         self.grid = grid
         self.t0 = t0
-        self.q_min = q_min
-        self.cap_m = cap_m
-        self.method = method
+        self.q_min = float(q_min)
         self.dtype = dtype or torch.get_default_dtype()
         self.device = device
+        self.times = [t for t, _ in self.series]
+        qs = []
+        for k, (_, p) in enumerate(self.series):
+            with rasterio.open(p) as ds:
+                a = ds.read(1).astype(float)
+                if ds.nodata is not None:
+                    a = np.where(a == ds.nodata, 0.0, a)
+                qs.append(np.clip(a, 0.0, None))
+                if k == 0:
+                    src_tr, src_crs = ds.transform, ds.crs
+        self.q = np.stack(qs)                          # (T, sy, sx) m3/s
+        sy, sx = self.q.shape[1:]
+        # solver cell -> containing EF5 pixel (same mapping as
+        # regrid_to_solver "containing")
+        ny, nx = tuple(grid.z.shape)
+        rows, cols = np.mgrid[0:ny, 0:nx]
+        xs, ys = grid.transform * (cols + 0.5, rows + 0.5)
+        same_crs = (src_crs is None and grid.crs is None) or (src_crs == grid.crs)
+        if not same_crs:
+            from rasterio.warp import transform as _tf
+            xs, ys = (np.asarray(v).reshape(ny, nx) for v in
+                      _tf(grid.crs or "EPSG:4326", src_crs or "EPSG:4326",
+                          xs.ravel(), ys.ravel()))
+        inv = ~src_tr
+        sc, sr = inv * (xs, ys)
+        sr = np.floor(sr).astype(int)
+        sc = np.floor(sc).astype(int)
+        valid = (sr >= 0) & (sr < sy) & (sc >= 0) & (sc < sx)
+        # keep the mapping for the level-based channel pre-wet
+        self.block = (np.where(valid, sr, -1), np.where(valid, sc, -1))
+        act = (active.detach().cpu().numpy().astype(bool)
+               if active is not None else np.ones((ny, nx), bool))
+        m = valid & act
+        inside = np.zeros((sy, sx), bool)
+        inside[sr[m], sc[m]] = True
+        qmax = self.q.max(axis=0)
+        chan = qmax >= self.q_min
+        self.inlets = []            # (src_r, src_c, solver_r, solver_c)
+        z = grid.z.detach().cpu().numpy()
+        cand = np.argwhere(chan & ~inside)
+        for i, j in cand:
+            best, bq = None, qmax[i, j]
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    if di == 0 and dj == 0:
+                        continue
+                    ii, jj = i + di, j + dj
+                    if 0 <= ii < sy and 0 <= jj < sx and qmax[ii, jj] > bq:
+                        best, bq = (ii, jj), qmax[ii, jj]
+            if best is None or not inside[best]:
+                continue            # downstream is outside too: not our inlet
+            cells = m & (sr == best[0]) & (sc == best[1])
+            if not cells.any():
+                continue
+            zc = np.where(cells, z, np.inf)
+            r, c = np.unravel_index(int(np.argmin(zc)), zc.shape)
+            self.inlets.append((int(i), int(j), int(r), int(c)))
+        self._cell_area = float(grid.dx * grid.dy)
         self._cache = {}
 
-    def stats(self, t_seconds=0.0):
-        s = self._stage(self._index(t_seconds))
-        n = int((s > 0).sum())
-        return {"channel_cells": n, "max_stage_m": float(s.max())}
+    # -- diagnostics ------------------------------------------------------ #
+    def total_m3s(self, t_seconds=0.0) -> float:
+        i = self._index(t_seconds)
+        return float(sum(self.q[i, a, b] for a, b, _, _ in self.inlets))
 
+    def stats(self, t_seconds=0.0):
+        return {"inlets": len(self.inlets), "total_m3s": self.total_m3s(t_seconds),
+                "peak_m3s": float(max((self.q[:, a, b].max() for a, b, _, _
+                                       in self.inlets), default=0.0))}
+
+    # -- forcing interface ------------------------------------------------ #
     def _index(self, t_seconds):
         when = self.t0 + _dt.timedelta(seconds=float(t_seconds))
-        i = bisect.bisect_right([t for t, _ in self.series], when) - 1
-        return max(0, min(i, len(self.series) - 1))
+        i = bisect.bisect_right(self.times, when) - 1
+        return max(0, min(i, len(self.times) - 1))
 
-    def _stage(self, i):
+    def _grid(self, i):
         if i not in self._cache:
-            import rasterio
-            _, path = self.series[i]
-            with rasterio.open(path) as ds:
-                src = ds.read(1).astype(float)
-                if ds.nodata is not None:
-                    src = np.where(src == ds.nodata, 0.0, src)
-                q = regrid_to_solver(np.clip(src, 0, None), ds.transform,
-                                     tuple(self.grid.z.shape),
-                                     self.grid.transform, ds.crs,
-                                     self.grid.crs, method=self.method)
-            qt = torch.as_tensor(q, dtype=self.dtype, device=self.device)
-            stage = torch.clamp(rating_depth(qt), max=self.cap_m)
-            stage = torch.where(qt >= self.q_min, stage,
-                                torch.zeros_like(stage))
-            self._cache = {i: stage}          # keep only the latest hour
+            g = torch.zeros(tuple(self.grid.z.shape), dtype=self.dtype,
+                            device=self.device)
+            for a, b, r, c in self.inlets:
+                g[r, c] += float(self.q[i, a, b]) / self._cell_area   # m/s
+            self._cache = {i: g}                  # keep only the latest hour
         return self._cache[i]
 
-    def __call__(self, t_seconds, h):
-        return torch.maximum(h, self._stage(self._index(t_seconds)))
+    def __call__(self, t_seconds: float) -> torch.Tensor:
+        return self._grid(self._index(t_seconds))
+
+    def next_change(self, t_seconds: float) -> float:
+        when = self.t0 + _dt.timedelta(seconds=float(t_seconds))
+        i = bisect.bisect_right(self.times, when)
+        if i >= len(self.times):
+            return float("inf")
+        return (self.times[i] - when).total_seconds()
 
 
 def initial_state_from_ef5(q_grid, sm_grid, dem, dx, dy,
-                           bankfull_width_fn=None):
+                           bankfull_width_fn=None, block=None, q_min=1.0):
     """Build (h, qx, qy) initial conditions from EF5 2-D Q and SM grids.
 
-    Channel pre-wetting: EF5 discharge Q [m3/s] on the routed network is
-    converted to an initial water depth along channel cells via a rating
-    approximation h ~ (n Q / (w sqrt(S)))^(3/5); off-channel cells start
-    dry. SM enters the CREST-AI side (it conditions the runoff EF5 sends
-    us) — kept here for provenance/diagnostics.
-
-    Experimental: exact rating and width model to be calibrated against
-    the differentiable solver itself once wired end-to-end.
+    ONE-TIME channel pre-wetting (this is the only place EF5 discharge puts
+    water inside the basin): Q [m3/s] on the routed network -> a channel
+    stage via a rating approximation h ~ (n Q / (w sqrt(S)))^(3/5). With
+    `block` = (sr, sc) solver-cell -> EF5-pixel index arrays (EF5InletInflow
+    .block), each EF5 channel pixel is filled to a water LEVEL = lowest bed
+    in the pixel + stage, so only the low cells (the channel) get water
+    instead of every cell of the 3x3 footprint carrying the full stage
+    uphill. Without `block` the stage is applied as a uniform depth (legacy,
+    synthetic tests). SM enters the CREST-AI side (it conditions the runoff
+    EF5 sends us) — kept here for provenance/diagnostics.
     """
     q = torch.as_tensor(np.asarray(q_grid, dtype=float))
-    h0 = torch.zeros_like(q)
     if bankfull_width_fn is None:
         bankfull_width_fn = lambda qq: torch.clamp(7.2 * qq ** 0.5, min=1.0)  # Leopold-Maddock-ish
-    chan = q > 1.0  # m3/s threshold for "channel" cells
+    chan = q >= q_min
     w = bankfull_width_fn(torch.clamp(q, min=0.0))
     n_ch, slope = 0.035, 1e-3
-    h_ch = (n_ch * torch.clamp(q, min=0.0) / (w * slope ** 0.5)) ** 0.6
-    h0 = torch.where(chan, torch.minimum(h_ch, torch.as_tensor(5.0)), h0)
+    stage = torch.minimum((n_ch * torch.clamp(q, min=0.0) / (w * slope ** 0.5)) ** 0.6,
+                          torch.as_tensor(5.0))
+    if block is None or dem is None:
+        h0 = torch.where(chan, stage, torch.zeros_like(stage))
+        return h0, torch.zeros_like(h0), torch.zeros_like(h0)
+    z = np.asarray(dem.detach().cpu().numpy() if torch.is_tensor(dem) else dem,
+                   dtype=float)
+    sr, sc = block
+    chan_np = chan.numpy()
+    pid = np.where(chan_np & (sr >= 0), sr.astype(np.int64) * (int(sc.max()) + 2)
+                   + sc.astype(np.int64), -1)
+    h0 = np.zeros_like(z)
+    if (pid >= 0).any():
+        ids, inv = np.unique(pid[pid >= 0], return_inverse=True)
+        zmin = np.full(ids.size, np.inf)
+        np.minimum.at(zmin, inv, z[pid >= 0])
+        level = zmin[inv] + stage.numpy()[pid >= 0]
+        h0[pid >= 0] = np.clip(level - z[pid >= 0], 0.0, None)
+    h0 = torch.as_tensor(h0, dtype=q.dtype)
     return h0, torch.zeros_like(h0), torch.zeros_like(h0)

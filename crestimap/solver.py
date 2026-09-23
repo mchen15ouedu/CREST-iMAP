@@ -342,8 +342,9 @@ class SWESolver:
         checkpoint_every : if > 0, wrap every N steps in
                   torch.utils.checkpoint to trade compute for memory when
                   backpropagating through long simulations.
-        nudge_fn : callable (t, h) -> h applied after each step — e.g. the
-                  EF5ChannelStage floor that couples routed channel flow in.
+        nudge_fn : callable (t, h) -> h applied after each step (tests /
+                  data assimilation only — NEVER a forcing: a per-step clamp
+                  is a mass source, see forcing.EF5InletInflow history)
         dt_every : recompute the CFL dt only every `dt_every` steps and hold
                   0.9x the last computed value in between. compute_dt ends
                   in a device->host sync (`.item()`); at GPU throughput that

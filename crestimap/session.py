@@ -62,8 +62,9 @@ class EventSession:
         import torch
         from . import dem as demmod
         from .event import _write_dem
-        from .forcing import (SolverGrid, initial_state_from_ef5,
-                              parse_ef5_dir, regrid_to_solver)
+        from .forcing import (EF5InletInflow, SolverGrid,
+                              initial_state_from_ef5, parse_ef5_dir,
+                              regrid_to_solver)
 
         self.cfg = cfg
         self.log = cfg.progress or (lambda s: None)
@@ -114,6 +115,21 @@ class EventSession:
             if init_frame:
                 t_state = init_frame[0]
 
+        # solver-cell -> EF5-pixel mapping for the level-based pre-wet (the
+        # inlet object itself is rebuilt per visit from that visit's bundle)
+        self._block = None
+        try:
+            first = EF5InletInflow(cfg.ef5_output_dir, grid, self.epoch,
+                                   active=self.active, model=cfg.model,
+                                   q_min=cfg.q_channel_min,
+                                   dtype=torch.float32)
+            self._block = first.block
+            st = first.stats(0.0)
+            self.log(f"channel coupling: {st['inlets']} inlet(s) where the "
+                     f"EF5 network enters the basin (peak "
+                     f"{st['peak_m3s']:.1f} m3/s); runoff grids route inside")
+        except Exception as e:
+            self.log(f"channel coupling unavailable ({type(e).__name__})")
         # channel pre-wet from the q grid nearest the state time
         h0 = torch.zeros_like(grid.z)
         qs = parse_ef5_dir(cfg.ef5_output_dir, "q", cfg.model)
@@ -129,14 +145,12 @@ class EventSession:
                                       (ny, nx), grid.transform, ds.crs,
                                       grid.crs)
             h0, _, _ = initial_state_from_ef5(qg, None, grid.z, grid.dx,
-                                              grid.dy)
+                                              grid.dy, block=self._block,
+                                              q_min=cfg.q_channel_min)
             # pin to the grid's device: an ambient torch default device (e.g.
             # torch.set_default_device("cuda") in a host app) must not split
             # this CPU-side setup across devices
-            qg_t = torch.as_tensor(qg).to(grid.z.device)
-            h0 = torch.where(qg_t >= cfg.q_channel_min,
-                             h0.to(torch.float32).to(grid.z.device),
-                             torch.zeros_like(grid.z))
+            h0 = h0.to(torch.float32).to(grid.z.device)
             self.log(f"channel pre-wet from q grid @ {t_near:%Y-%m-%d %H:%M} "
                      f"({int((qg >= cfg.q_channel_min).sum())} channel cells)")
 
@@ -175,7 +189,6 @@ class EventSession:
         self.maxspeed = torch.zeros_like(h0)
         self.flowdir = torch.full(h0.shape, 255, dtype=torch.uint8, device=h0.device)
         self.t = (t_state - self.epoch).total_seconds()
-        self._nudged_once = False
         self.visit = None                 # active-visit dict, else parked
 
     # ------------------------------------------------------------------ #
@@ -250,7 +263,7 @@ class EventSession:
         Returns True when the visit has reached t_end."""
         import torch
         from . import io as iomod
-        from .forcing import EF5ChannelStage, ef5_forcing
+        from .forcing import EF5InletInflow, ef5_forcing, sum_forcings
         from .solver import SWESolver
 
         v = self.visit
@@ -274,23 +287,22 @@ class EventSession:
         rain = ef5_forcing(v["forcing_dir"], grid, self.epoch,
                            model=cfg.model, dtype=torch.float32,
                            device=device)
+        # routed-flow coupling = boundary inflow at the basin's channel
+        # inlets (this visit's bundle carries the hours it needs)
         try:
-            nudge = EF5ChannelStage(v["forcing_dir"], grid, self.epoch,
-                                    model=cfg.model, q_min=cfg.q_channel_min,
-                                    dtype=torch.float32, device=device)
+            inlet = EF5InletInflow(v["forcing_dir"], grid, self.epoch,
+                                   active=self.active, model=cfg.model,
+                                   q_min=cfg.q_channel_min,
+                                   dtype=torch.float32, device=device)
+            if inlet.inlets:
+                rain = sum_forcings(rain, inlet)
         except Exception as e:
-            nudge = None
-            if not self._nudged_once:
-                self.log(f"channel coupling unavailable ({type(e).__name__})")
+            self.log(f"inlet inflow unavailable this visit ({type(e).__name__})")
 
         h = self.h.to(device)
         qx = self.qx.to(device)
         qy = self.qy.to(device)
         md = self.maxdepth.to(device)
-        if nudge is not None and not self._nudged_once:
-            h = nudge(self.t, h)              # channel water present at start
-            h, qx, qy = solver.mask_state(h, qx, qy)
-            self._nudged_once = True
 
         state = {"md": md, "ms": self.maxspeed.to(device),
                  "fd": self.flowdir.to(device)}
@@ -340,13 +352,13 @@ class EventSession:
                                  log=self.log)
                 ts.scatter(h.cpu(), qx.cpu(), qy.cpu(), md.cpu())
                 ts.run(t_end=t_hi, rain_fn=rain, t0=self.t, callback=cb_tiled,
-                       nudge_fn=nudge, dt_every=cfg.dt_every)
+                       dt_every=cfg.dt_every)
                 h, qx, qy = ts.gather()
                 state["md"] = ts.gather_maxdepth()
                 del ts
             else:
                 h, qx, qy = solver.run(h, qx, qy, t_end=t_hi, rain_fn=rain,
-                                       t0=self.t, callback=cb, nudge_fn=nudge,
+                                       t0=self.t, callback=cb,
                                        dt_every=cfg.dt_every)
         self.h, self.qx, self.qy = h.cpu(), qx.cpu(), qy.cpu()
         self.maxdepth = state["md"].cpu()
@@ -432,12 +444,12 @@ class EventSession:
     def state_tuple(self):
         v = self.visit
         return (self.h, self.qx, self.qy, self.maxdepth, self.maxspeed,
-                self.flowdir, self.t, self._nudged_once,
+                self.flowdir, self.t,
                 (v["frames"], v["next_frame"], v["snapshot"]) if v else None)
 
     def set_state(self, tup):
         (self.h, self.qx, self.qy, self.maxdepth, self.maxspeed,
-         self.flowdir, self.t, self._nudged_once, vt) = tup
+         self.flowdir, self.t, vt) = tup
         if vt is not None and self.visit is not None:
             self.visit["frames"], self.visit["next_frame"], \
                 self.visit["snapshot"] = vt

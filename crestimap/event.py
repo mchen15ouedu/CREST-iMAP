@@ -98,9 +98,9 @@ def run_event(cfg: EventConfig) -> dict:
     import torch
     from . import dem as demmod
     from . import io as iomod
-    from .forcing import (EF5ChannelStage, SolverGrid, ef5_forcing,
+    from .forcing import (EF5InletInflow, SolverGrid, ef5_forcing,
                           initial_state_from_ef5, parse_ef5_dir,
-                          regrid_to_solver)
+                          regrid_to_solver, sum_forcings)
     from .solver import SWESolver
 
     say = cfg.progress or (lambda s: None)
@@ -126,6 +126,22 @@ def run_event(cfg: EventConfig) -> dict:
     sim_start = cfg.sim_start or (cfg.t0 - datetime.timedelta(hours=6))
     rain = ef5_forcing(cfg.ef5_output_dir, grid, sim_start, model=cfg.model,
                        dtype=dtype, device=cfg.device)
+    # routed-flow coupling = BOUNDARY CONDITION: EF5 discharge enters only
+    # where its channel network crosses into the basin (see EF5InletInflow)
+    inlet = None
+    try:
+        inlet = EF5InletInflow(cfg.ef5_output_dir, grid, sim_start,
+                               active=active, model=cfg.model,
+                               q_min=cfg.q_channel_min, dtype=dtype,
+                               device=cfg.device)
+        st = inlet.stats(0.0)
+        say(f"channel coupling: {st['inlets']} inlet(s) where the EF5 "
+            f"network enters the basin, {st['total_m3s']:.1f} m3/s at sim "
+            f"start (peak {st['peak_m3s']:.1f}); runoff grids route inside")
+        if inlet.inlets:
+            rain = sum_forcings(rain, inlet)
+    except Exception as e:
+        say(f"channel coupling unavailable ({type(e).__name__}: {e})")
     h0 = torch.zeros_like(grid.z)
     qx0 = torch.zeros_like(grid.z)
     qy0 = torch.zeros_like(grid.z)
@@ -140,10 +156,11 @@ def run_event(cfg: EventConfig) -> dict:
                 src = np.where(src == ds.nodata, 0.0, src)
             qg = regrid_to_solver(np.clip(src, 0, None), ds.transform,
                                   (ny, nx), grid.transform, ds.crs, grid.crs)
-        h0, qx0, qy0 = initial_state_from_ef5(qg, None, grid.z, grid.dx, grid.dy)
+        h0, qx0, qy0 = initial_state_from_ef5(
+            qg, None, grid.z, grid.dx, grid.dy,
+            block=(inlet.block if inlet is not None else None),
+            q_min=cfg.q_channel_min)
         h0 = h0.to(dtype=dtype, device=cfg.device)
-        h0 = torch.where(torch.as_tensor(qg, device=cfg.device) >=
-                         cfg.q_channel_min, h0, torch.zeros_like(h0))
         qx0 = torch.zeros_like(h0)
         qy0 = torch.zeros_like(h0)
         say(f"channel pre-wet from q grid @ {t_near:%Y-%m-%d %H:%M} "
@@ -182,31 +199,6 @@ def run_event(cfg: EventConfig) -> dict:
         say(f"warm continuation from {os.path.basename(init_path)} "
             f"({int((prev_t > 0.02).sum())} wet cells carried over)")
 
-    # routed-flood coupling: EF5's hourly discharge grids drive the channel
-    # stage all through the run (recession events carry their water in the
-    # routed network, not the local runoff grids — without this, an event
-    # triggered days after the rain simulates dry)
-    nudge = None
-    try:
-        nudge = EF5ChannelStage(cfg.ef5_output_dir, grid, sim_start,
-                                model=cfg.model, q_min=cfg.q_channel_min,
-                                dtype=dtype, device=cfg.device)
-        # diagnose the raw EF5 q grid before trusting the coupling
-        import rasterio as _rio
-        _, qp = nudge.series[nudge._index(0.0)]
-        with _rio.open(qp) as ds:
-            qsrc = ds.read(1).astype(float)
-            if ds.nodata is not None:
-                qsrc = np.where(qsrc == ds.nodata, np.nan, qsrc)
-        say(f"q grid {os.path.basename(qp)}: src max {np.nanmax(qsrc):.2f} m3/s, "
-            f"src cells>= {cfg.q_channel_min}: {int(np.nansum(qsrc >= cfg.q_channel_min))}, "
-            f"shape {qsrc.shape}")
-        st = nudge.stats(0.0)
-        say(f"channel coupling: {st['channel_cells']} channel cells on solver "
-            f"grid, max stage {st['max_stage_m']:.2f} m at sim start")
-    except Exception as e:
-        say(f"channel coupling unavailable ({type(e).__name__}: {e})")
-
     # ---- integrate ------------------------------------------------------ #
     solver = SWESolver(grid.z, dx=grid.dx, dy=grid.dy, n_manning=cfg.n_manning,
                        order=2, bc="open", active=active)
@@ -238,11 +230,8 @@ def run_event(cfg: EventConfig) -> dict:
 
     say(f"integrating {t_total / 3600:.1f} h "
         f"({sim_start:%m-%d %H:%M} -> {cfg.t_end:%m-%d %H:%M} UTC)")
-    if nudge is not None:
-        h0 = nudge(0.0, h0)               # channel water present from t=0
-        h0, qx0, qy0 = solver.mask_state(h0, qx0, qy0)
     solver.run(h0, qx0, qy0, t_end=t_total, rain_fn=rain, callback=cb,
-               nudge_fn=nudge, dt_every=cfg.dt_every)
+               dt_every=cfg.dt_every)
 
     iomod.write_depth(os.path.join(cfg.out_dir, "maxdepth.tif"),
                       maxdepth.detach().cpu().numpy(), grid.transform, grid.crs)
@@ -262,6 +251,8 @@ def run_event(cfg: EventConfig) -> dict:
                  "transform": list(grid.transform)[:6],
                  "crs": str(grid.crs) if grid.crs else None},
         "n_manning": cfg.n_manning, "frames": frames,
+        "coupling": {"mode": "inlet-inflow",
+                     "inlets": len(inlet.inlets) if inlet is not None else 0},
         "maxdepth": "maxdepth.tif", "maxspeed": "maxspeed.tif",
         "flowdir": "flowdir.tif", "dem": "dem.tif",
         "generated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),

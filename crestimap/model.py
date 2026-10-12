@@ -21,8 +21,11 @@ steps on its own CFL dt inside each):
   1. CREST_step(P, PET, SM) -> overland + interflow depths, updated SM.
   2. That runoff depth / dt_h becomes the lateral-inflow rate handed to
      SWESolver.run(rain_fn=...) for the next dt_h of hydrodynamic routing.
-  3. Surface water sitting on a cell is offered back to CREST for
-     re-infiltration next step (v1 behaviour; toggle reinfiltration=False).
+  3. Surface water sitting on a cell is offered back to CREST with the next
+     step's rain (re-infiltration, v1 behaviour; toggle reinfiltration=False),
+     so ET and infiltration act on ponded water. What CREST returns refills
+     the standing water first (momentum scaled with depth) and only the
+     excess enters as lateral inflow, so surface + soil + ET closes exactly.
 
 Set `route_interflow=False` to keep subsurface interflow as a separate slow
 store instead of adding it to the routed surface inflow (default True adds
@@ -103,11 +106,24 @@ class CRESTiMAP:
             sm_new, overland_mm, interflow_mm, _ = crest_step(
                 precip_mm, pet_mm, sm * 1000.0, self.params, dt_h)
             sm = sm_new / 1000.0
-            if self.reinfiltration:
-                # the surface water we offered was consumed by CREST; the
-                # overland depth it returns is the new standing water
-                h = torch.zeros_like(h)
             runoff_mm = overland_mm + (interflow_mm if self.route_interflow else 0.0)
+            if self.reinfiltration:
+                # Operator split: what CREST returns refills the standing water
+                # first, so the surface loses only what ET and infiltration
+                # took; momentum scales with depth (velocity kept).  Zeroing h
+                # while keeping qx/qy and re-adding all of it as a source over
+                # the step would leave momentum on dry cells and empty every
+                # channel and lake once per step.  Only the excess over the
+                # offered water enters as a source.
+                keep_mm = torch.minimum(runoff_mm, surf_mm)
+                h_new = keep_mm / 1000.0
+                ratio = torch.where(h > 0, h_new / torch.clamp(h, min=1e-12),
+                                    torch.zeros_like(h))
+                if self.mask is not None:
+                    h_new = torch.where(self.mask, h_new, h)
+                    ratio = torch.where(self.mask, ratio, torch.ones_like(ratio))
+                h, qx, qy = h_new, qx * ratio, qy * ratio
+                runoff_mm = runoff_mm - keep_mm
             inflow_rate = (runoff_mm / 1000.0) / dt_h    # m/s, constant over dt_h
             if self.mask is not None:
                 inflow_rate = torch.where(self.mask, inflow_rate,

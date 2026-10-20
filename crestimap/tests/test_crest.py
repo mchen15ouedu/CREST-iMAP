@@ -90,7 +90,7 @@ def test_coupled_run_on_tilted_plane():
                                   units="mm/h")
     pet = weather.constant(0.0, grid.z.shape, units="mm/day")
     m = CRESTiMAP(grid, CRESTParams(WM=80.0, B=0.3, IM=0.05, Ksat=8.0),
-                  n_manning=0.05, reinfiltration=False)
+                  n_manning=0.05, reinfiltration=False, interflow="local")
     res = m.run(rain, pet, t_end_s=6 * 3600, sm0=0.06)  # near-saturated soil
     assert torch.isfinite(res["max_depth"]).all()
     assert res["max_depth"].max() > 0.0, "rain on a near-saturated basin must pond"

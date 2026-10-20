@@ -12,6 +12,12 @@ Scheme
   second order per Audusse et al. Sec. 4).
 - SSP-RK2 (Heun) time stepping, adaptive CFL timestep (detached from the
   autograd graph so gradients stay well defined).
+- Draining-time outflow limiter (Bollermann, Noelle & Lukacova-Medvidova
+  2013, Commun. Comput. Phys. 10:371): inside each RK stage a cell's
+  outgoing fluxes are scaled so it cannot export more than the water it
+  holds. The CFL dt is picked from the start-of-step state; a thin sheet
+  on a slope accelerates by g*S*dt within the step, so without the limiter
+  the stage update goes negative and the depth clamp creates water.
 - Point-implicit Manning friction (closed form, differentiable).
 - Desingularized velocities u = sqrt(2) h q / sqrt(h^4 + max(h,eps)^4)
   (Kurganov & Petrova 2007) so wet/dry fronts neither blow up nor produce
@@ -82,10 +88,13 @@ class SWESolver:
         leaving through the pour point vanishes (free outflow) and nothing
         is ever simulated outside the hydrologic unit. None = whole raster
         (rectangular domain — only for synthetic tests).
+    drain_limit : draining-time outflow limiter (default on). False restores
+        the pre-2026-10-20 scheme, whose depth clamp is a mass source.
     """
 
     def __init__(self, z, dx, dy, n_manning=0.03, g=G_DEFAULT, eps=1e-6,
-                 cfl=0.45, order=2, bc="wall", dt_max=60.0, active=None):
+                 cfl=0.45, order=2, bc="wall", dt_max=60.0, active=None,
+                 drain_limit=True):
         self.z = z if torch.is_tensor(z) else torch.as_tensor(z, dtype=torch.get_default_dtype())
         self.dtype = self.z.dtype
         self.device = self.z.device
@@ -107,6 +116,7 @@ class SWESolver:
             active = active.to(device=self.device, dtype=torch.bool)
             assert active.shape == self.z.shape, "active mask must match z"
         self.active = active
+        self.drain_limit = bool(drain_limit)
         self._zero = None
 
     # ------------------------------------------------------------------ #
@@ -177,11 +187,14 @@ class SWESolver:
     # ------------------------------------------------------------------ #
     # directional flux divergence with hydrostatic reconstruction
     # ------------------------------------------------------------------ #
-    def _flux_div(self, hp, up, vp, zp, axis):
-        """Flux divergence + bed source along `axis` for interior cells.
+    def _face_fluxes(self, hp, up, vp, zp, axis):
+        """Face fluxes + bed source along `axis` for interior cells.
 
-        Returns (div_h, div_qx, div_qy) shaped (ny, nx): contribution to
-        dU/dt (already negated, source included).
+        Returns (F_h, F_qn, F_qt, corr_m, corr_p, src_c). Face arrays are
+        (ny, nx+1) for axis 1 / (ny+1, nx) for axis 0, boundary faces
+        included. F_qn is the HLL normal-momentum flux WITHOUT the Audusse
+        per-side pressure corrections corr_m (seen by the minus-side cell)
+        and corr_p (plus side); src_c is the centered bed-slope source.
         """
         g = self.g
         d = self.dx if axis == 1 else self.dy
@@ -240,28 +253,32 @@ class SWESolver:
         # Audusse per-side pressure corrections (normal momentum only)
         corr_m = 0.5 * g * (hm ** 2 - hms ** 2)
         corr_p = 0.5 * g * (hpl ** 2 - hps ** 2)
-        fn_m = flux[1] + corr_m   # face flux seen by the minus-side cell
-        fn_p = flux[1] + corr_p   # face flux seen by the plus-side cell
 
         # centered bed-slope source inside each cell: -g*hbar*dz (2nd order)
         hbar = 0.5 * (hL + hR)
+        src = -g * hbar * (zR - zL) / d
         if axis == 1:
-            src = -g * hbar * (zR - zL) / d
-            div_h = (flux[0][:, 1:] - flux[0][:, :-1]) / d
-            div_qn = (fn_m[:, 1:] - fn_p[:, :-1]) / d
-            div_qt = (flux[2][:, 1:] - flux[2][:, :-1]) / d
             src_c = src[:, 1:-1]
             sl = lambda t: t[2:-2, :]      # cross direction: drop both ghost rings
-            div_h, div_qn, div_qt, src_c = map(sl, (div_h, div_qn, div_qt, src_c))
         else:
-            src = -g * hbar * (zR - zL) / d
-            div_h = (flux[0][1:, :] - flux[0][:-1, :]) / d
-            div_qn = (fn_m[1:, :] - fn_p[:-1, :]) / d
-            div_qt = (flux[2][1:, :] - flux[2][:-1, :]) / d
             src_c = src[1:-1, :]
             sl = lambda t: t[:, 2:-2]
-            div_h, div_qn, div_qt, src_c = map(sl, (div_h, div_qn, div_qt, src_c))
+        return tuple(map(sl, (flux[0], flux[1], flux[2], corr_m, corr_p, src_c)))
 
+    def _assemble(self, F_h, F_qn, F_qt, corr_m, corr_p, src_c, axis):
+        """Face fluxes -> contribution to dU/dt along `axis` (negated
+        divergence + bed source), as (rhs_h, rhs_qx, rhs_qy)."""
+        d = self.dx if axis == 1 else self.dy
+        fn_m = F_qn + corr_m   # face flux seen by the minus-side cell
+        fn_p = F_qn + corr_p   # face flux seen by the plus-side cell
+        if axis == 1:
+            div_h = (F_h[:, 1:] - F_h[:, :-1]) / d
+            div_qn = (fn_m[:, 1:] - fn_p[:, :-1]) / d
+            div_qt = (F_qt[:, 1:] - F_qt[:, :-1]) / d
+        else:
+            div_h = (F_h[1:, :] - F_h[:-1, :]) / d
+            div_qn = (fn_m[1:, :] - fn_p[:-1, :]) / d
+            div_qt = (F_qt[1:, :] - F_qt[:-1, :]) / d
         rhs_h = -div_h
         rhs_qn = -div_qn + src_c
         rhs_qt = -div_qt
@@ -269,13 +286,55 @@ class SWESolver:
             return rhs_h, rhs_qn, rhs_qt
         return rhs_h, rhs_qt, rhs_qn
 
+    def _drain_factor(self, h, Fx, Fy, dt, rain):
+        """Draining-time factor theta in [0, 1] per cell (Bollermann et al.
+        2013): the share of its outgoing mass flux a cell can deliver over
+        `dt` without going negative, theta = min(1, avail / (dt * out)),
+        avail = h + dt*rain. Inflows only add water, so scaling every
+        cell's outflow by its own theta keeps h + dt*rhs >= 0 for ANY dt.
+        At lake at rest every mass flux is exactly 0, so theta == 1 and
+        the C-property is untouched. where/clamp only: differentiable,
+        no host sync."""
+        out = ((torch.relu(Fx[:, 1:]) + torch.relu(-Fx[:, :-1])) / self.dx
+               + (torch.relu(Fy[1:, :]) + torch.relu(-Fy[:-1, :])) / self.dy)
+        avail = h if rain is None else torch.clamp(h + dt * rain, min=0.0)
+        demand = dt * out
+        # the demand floor keeps the backward of avail/demand finite
+        floor = 10.0 * math.sqrt(torch.finfo(h.dtype).tiny)
+        need = (demand > avail) & (demand > floor)
+        safe = torch.where(need, demand, torch.ones_like(demand))
+        return torch.where(need, avail / safe, torch.ones_like(avail))
+
+    @staticmethod
+    def _donor(theta, F, axis):
+        """Per-face factor: theta of the cell the mass flux leaves. Ghost
+        donors at the raster edge are not limited (1)."""
+        if axis == 1:
+            one = torch.ones_like(theta[:, :1])
+            tp = torch.cat([one, theta, one], dim=1)
+            return torch.where(F > 0, tp[:, :-1], tp[:, 1:])
+        one = torch.ones_like(theta[:1, :])
+        tp = torch.cat([one, theta, one], dim=0)
+        return torch.where(F > 0, tp[:-1, :], tp[1:, :])
+
     # ------------------------------------------------------------------ #
-    def _rhs(self, h, qx, qy, rain=None):
+    def _rhs(self, h, qx, qy, rain=None, dt=None):
+        """dU/dt. Given the stage length `dt` (and drain_limit on), each
+        cell's outgoing fluxes — mass and the matching momentum — are
+        scaled by its draining-time factor so the stage cannot drive the
+        cell negative (the h >= 0 clamp then never creates water)."""
         hp, qxp, qyp, zp = self._pad(h, qx, qy)
         up = desing_velocity(hp, qxp, self.eps)
         vp = desing_velocity(hp, qyp, self.eps)
-        rx_h, rx_qx, rx_qy = self._flux_div(hp, up, vp, zp, axis=1)
-        ry_h, ry_qx, ry_qy = self._flux_div(hp, up, vp, zp, axis=0)
+        fx = list(self._face_fluxes(hp, up, vp, zp, axis=1))
+        fy = list(self._face_fluxes(hp, up, vp, zp, axis=0))
+        if dt is not None and self.drain_limit:
+            theta = self._drain_factor(h, fx[0], fy[0], dt, rain)
+            for f, axis in ((fx, 1), (fy, 0)):
+                tf = self._donor(theta, f[0], axis)
+                f[0], f[1], f[2] = tf * f[0], tf * f[1], tf * f[2]
+        rx_h, rx_qx, rx_qy = self._assemble(*fx, axis=1)
+        ry_h, ry_qx, ry_qy = self._assemble(*fy, axis=0)
         rh = rx_h + ry_h
         if rain is not None:
             rh = rh + rain
@@ -307,11 +366,11 @@ class SWESolver:
         """One SSP-RK2 step. Returns (h, qx, qy, dt_used)."""
         if dt is None:
             dt = self.compute_dt(h, qx, qy)
-        r1 = self._rhs(h, qx, qy, rain)
+        r1 = self._rhs(h, qx, qy, rain, dt)
         h1 = torch.clamp(h + dt * r1[0], min=0.0)
         qx1 = qx + dt * r1[1]
         qy1 = qy + dt * r1[2]
-        r2 = self._rhs(h1, qx1, qy1, rain)
+        r2 = self._rhs(h1, qx1, qy1, rain, dt)
         hn = torch.clamp(0.5 * h + 0.5 * (h1 + dt * r2[0]), min=0.0)
         qxn = 0.5 * qx + 0.5 * (qx1 + dt * r2[1])
         qyn = 0.5 * qy + 0.5 * (qy1 + dt * r2[2])

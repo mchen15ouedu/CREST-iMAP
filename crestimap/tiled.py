@@ -23,8 +23,10 @@ tile g                : rect [r0:r1, c0:c1] = bounds of its OWNED cells + a
                                  exactly like SWESolver(active=...))
 Step
 ----
-SSP-RK2 with a halo exchange after EACH stage (halo = 2 covers the MUSCL
-+ hydrostatic-reconstruction stencil of one stage). Owned cells therefore
+SSP-RK2 with a halo exchange after EACH stage. halo = 3 covers one
+stage's stencil: MUSCL + hydrostatic reconstruction reach 2 cells, and the
+draining-time limiter (SWESolver._drain_factor) needs each neighbour's
+outflow over all its faces, one cell more. Owned cells therefore
 see exactly the values the monolithic masked solve would give them: the
 tiled result is bit-identical to SWESolver(active=mask) on the union grid
 (tests/test_tiled.py). Global CFL dt = min over tiles.
@@ -104,7 +106,7 @@ class Tile:
 
 class TiledSolver:
     def __init__(self, z, labels, dx, dy, devices, n_manning=0.05, n_tiles=None,
-                 halo=2, order=2, bc="open", eps=1e-6, cfl=0.45, dt_max=60.0,
+                 halo=3, order=2, bc="open", eps=1e-6, cfl=0.45, dt_max=60.0,
                  dtype=torch.float32, log=lambda s: None):
         """z: (ny, nx) tensor/array (CPU); labels: (ny, nx) int16 numpy."""
         z = torch.as_tensor(np.asarray(z), dtype=dtype)
@@ -260,7 +262,7 @@ class TiledSolver:
         # stage 1
         for t, rf in zip(self.tiles, rains):
             rain = rf() if rf is not None else None
-            r1 = t.solver._rhs(t.h, t.qx, t.qy, rain)
+            r1 = t.solver._rhs(t.h, t.qx, t.qy, rain, dt)
             t.h1 = torch.clamp(t.h + dt * r1[0], min=0.0)   # noqa (dynamic attrs)
             t.qx1 = t.qx + dt * r1[1]
             t.qy1 = t.qy + dt * r1[2]
@@ -268,7 +270,7 @@ class TiledSolver:
         # stage 2
         for t, rf in zip(self.tiles, rains):
             rain = rf() if rf is not None else None
-            r2 = t.solver._rhs(t.h1, t.qx1, t.qy1, rain)
+            r2 = t.solver._rhs(t.h1, t.qx1, t.qy1, rain, dt)
             hn = torch.clamp(0.5 * t.h + 0.5 * (t.h1 + dt * r2[0]), min=0.0)
             qxn = 0.5 * t.qx + 0.5 * (t.qx1 + dt * r2[1])
             qyn = 0.5 * t.qy + 0.5 * (t.qy1 + dt * r2[2])

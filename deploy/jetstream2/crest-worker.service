@@ -1,0 +1,69 @@
+# /etc/systemd/system/crest-worker.service - installed by bootstrap.sh.
+# CREST-iMAP v2 GPU event worker on Jetstream2: `python -m crestimap.worker
+# --sessions --publish` pulling the 2-D inundation queue in the public HF
+# dataset vincewin/CREST_data (events/queue/). Runbook: docs/JETSTREAM2_WORKER.md
+#
+# bootstrap.sh installs this unit but never enables or starts it. The PI
+# starts it at validation gate G2:  sudo systemctl enable --now crest-worker
+
+[Unit]
+Description=CREST-iMAP v2 GPU event worker (queue vincewin/CREST_data)
+Documentation=https://github.com/mchen15ouedu/CREST-iMAP/blob/v2/docs/JETSTREAM2_WORKER.md
+Wants=network-online.target
+After=network-online.target gpu-driver-fix.service nvidia-persistenced.service
+# Never start without the token: fail loudly instead of looping on 401s.
+AssertFileNotEmpty=/etc/crest-worker/hf_token
+# A crash loop re-claims the same job each time (2 commits per round against
+# the account-wide 256 commits/h): give up after 6 starts in an hour.
+# Recover with: systemctl reset-failed crest-worker && systemctl start crest-worker
+StartLimitIntervalSec=3600
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=crest
+Group=crest
+EnvironmentFile=/etc/crest-worker/crest-worker.env
+Environment=CREST_HOME=/opt/crest-worker
+Environment=PYTHONUNBUFFERED=1
+# Token: the root-only file is copied by systemd into a private credentials
+# dir readable only by this service ($CREDENTIALS_DIRECTORY/hf_token =
+# /run/credentials/crest-worker.service/hf_token). crestimap.worker reads
+# ~/huggingface.txt when HF_TOKEN is unset; bootstrap.sh makes that a symlink
+# to the credential, so the token is never in the env file, the unit, the
+# command line or `systemctl show`.
+LoadCredential=hf_token:/etc/crest-worker/hf_token
+UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
+WorkingDirectory=/opt/crest-worker
+# Waits for the GPU (gpu-driver-fix.service at boot), refuses unsafe config
+# (retention env vars, oversized cell budget, release without pinned_ids,
+# missing token), clears RAM-orphaned session dirs.
+ExecStartPre=/opt/crest-worker/bin/preflight.sh
+# Release claims a previous incarnation on this host left behind (crash, hard
+# reboot, maintenance stop). Failure here never blocks the start.
+ExecStartPre=-/opt/crest-worker/venv/bin/python /opt/crest-worker/bin/release_claims.py --apply
+ExecStart=/opt/crest-worker/bin/run-worker.sh
+# crestimap.worker has no signal handler. SIGINT raises KeyboardInterrupt in
+# its main thread: the visit's finally-block stops the heartbeat thread and the
+# process exits within seconds (within TimeoutStopSec at worst; then SIGKILL).
+# The claim it held is then deleted below with the worker's own
+# Worker._cleanup_queue(success=False) - the queue entry is NOT consumed, so
+# ZeroGPU or the restarted worker takes the event at once instead of after
+# the 600 s stale timeout.
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStartSec=600
+TimeoutStopSec=180
+ExecStopPost=-/opt/crest-worker/venv/bin/python /opt/crest-worker/bin/release_claims.py --apply
+Restart=always
+RestartSec=120
+SyslogIdentifier=crest-worker
+LimitNOFILE=65536
+# Hardening. Do NOT add PrivateDevices= (it hides /dev/nvidia*).
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

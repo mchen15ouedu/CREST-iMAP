@@ -1,0 +1,13 @@
+# /etc/systemd/system/crest-worker-update.timer - installed and enabled by
+# bootstrap.sh unless AUTO_UPDATE=0 in /etc/crest-worker/crest-worker.env.
+[Unit]
+Description=Daily CREST worker code refresh
+
+[Timer]
+# 14:00 UTC = morning in Oklahoma, so a failed run is seen the same day
+OnCalendar=*-*-* 14:00:00 UTC
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

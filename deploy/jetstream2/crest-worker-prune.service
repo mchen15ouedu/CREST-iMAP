@@ -1,0 +1,17 @@
+# /etc/systemd/system/crest-worker-prune.service - installed by bootstrap.sh.
+# Daily cache housekeeping for crest-worker (see prune.sh). Local disk only.
+[Unit]
+Description=Prune CREST worker caches (HF download blobs; DEM tiles under disk pressure)
+Documentation=https://github.com/mchen15ouedu/CREST-iMAP/blob/v2/docs/JETSTREAM2_WORKER.md
+
+[Service]
+Type=oneshot
+User=crest
+Group=crest
+EnvironmentFile=/etc/crest-worker/crest-worker.env
+ExecStart=/opt/crest-worker/bin/prune.sh
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes

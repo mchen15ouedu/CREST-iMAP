@@ -1,0 +1,11 @@
+# /etc/systemd/system/crest-worker-prune.timer - installed and enabled by bootstrap.sh.
+[Unit]
+Description=Daily CREST worker cache prune
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

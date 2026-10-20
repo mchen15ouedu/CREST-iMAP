@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# crest-py - run the worker's Python as the `crest` user with the worker's env
+# file and the CURRENT release on sys.path, but WITHOUT the HF token. For the
+# read-only kit tools and the CUDA test suite:
+#   sudo crest-py /opt/crest-worker/bin/queue_status.py
+#   sudo crest-py /opt/crest-worker/bin/replay_bundle.py --event <id>
+#   sudo crest-py CRESTIMAP_TEST_DEVICE=cuda -m pytest -q -p no:cacheprovider crestimap/tests
+# Leading KEY=VALUE arguments are added to the (otherwise clean) environment.
+# The working directory is the release's CREST-iMAP checkout.
+set -euo pipefail
+here=$(dirname "$(readlink -f "$0")")
+# shellcheck source=lib.sh
+. "$here/lib.sh"
+require_root
+load_env_file "$CREST_ENV_FILE"
+rel=$(readlink -e "$CREST_HOME/current") || die "no current release - run bootstrap.sh"
+
+envs=(PATH=/usr/local/bin:/usr/bin:/bin "HOME=$CREST_VAR" LANG=C.UTF-8 PYTHONUNBUFFERED=1
+  HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_IMPLICIT_TOKEN=1 "CREST_HOME=$CREST_HOME"
+  "PYTHONPATH=$rel/CREST-iMAP:$rel/CREST_AI" "CREST_AI_DIR=$rel/CREST_AI")
+for k in "${CREST_ENV_KEYS[@]}"; do
+  envs+=("$k=${!k}")
+done
+while [ $# -gt 0 ] && [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+  envs+=("$1")
+  shift
+done
+[ $# -gt 0 ] || die "usage: sudo crest-py [KEY=VALUE ...] <python args...>"
+for e in "${envs[@]}"; do
+  case $e in HF_TOKEN=* | HUGGING_FACE_HUB_TOKEN=* | HF_TOKEN_PATH=*)
+    die "crest-py never passes a token" ;;
+  esac
+done
+cd "$rel/CREST-iMAP"
+exec runuser -u "$CREST_USER" -- env -i "${envs[@]}" "$PY" "$@"

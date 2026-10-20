@@ -1,0 +1,24 @@
+# /etc/systemd/system/crest-worker-update.service - installed by bootstrap.sh.
+# Daily code refresh for crest-worker: `update.sh --auto` builds a release
+# from FORK_REF (unchanged: the solver stays pinned) and the newest CREST_AI
+# main hf_data/, verifies it (pinned_ids, minimum commits, solver-path guard,
+# import self-test) and restarts the worker into it only when hf_data/ (or
+# the fork SHA) changed and only while the worker holds no claim. A busy
+# worker defers to the next run; a release that does not stay up is rolled
+# back. Without this a persistent worker keeps its first hf_data forever
+# (the HPC failure mode). Opt out: AUTO_UPDATE=0 in the env file, then re-run
+# bootstrap.sh (or: systemctl disable --now crest-worker-update.timer).
+[Unit]
+Description=Refresh CREST worker code (CREST_AI main hf_data) between visits
+Documentation=https://github.com/mchen15ouedu/CREST-iMAP/blob/v2/docs/JETSTREAM2_WORKER.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root because update.sh stops and starts crest-worker; it builds and
+# tests the release as the crest user. No pip, no token.
+ExecStart=/opt/crest-worker/bin/update.sh --auto
+# wait_idle may wait up to 45 min, plus the build
+TimeoutStartSec=2h
+Nice=10

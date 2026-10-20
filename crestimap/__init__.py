@@ -33,9 +33,10 @@ from .analytic import stoker_dambreak
 from .event import EventConfig, run_event
 from .crest import CRESTParams, crest_step, crest_step_si
 from .model import CRESTiMAP
+from .subsurface import KWInterflowParams
 from . import weather
 
 __version__ = "2.0.0.dev0"
 __all__ = ["SWESolver", "desing_velocity", "minmod", "stoker_dambreak",
            "EventConfig", "run_event", "CRESTParams", "crest_step",
-           "crest_step_si", "CRESTiMAP", "weather"]
+           "crest_step_si", "CRESTiMAP", "KWInterflowParams", "weather"]

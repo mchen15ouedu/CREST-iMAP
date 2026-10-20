@@ -9,6 +9,9 @@ Run:  python -m pytest crestimap/tests -q     (or run this file directly)
    injected volume.
 4. Gradients: d(loss)/d(Manning n) and d(loss)/d(bed scale) from autograd
    match central finite differences.
+5. Draining-time limiter: a thin sheet on a slope at cfl 0.45 conserves
+   mass (the depth clamp used to create ~10 %), lake at rest over steep
+   terrain stays at rest, gradients and checkpointing work through it.
 """
 import math
 import os
@@ -180,10 +183,124 @@ def test_basin_mask_sink_and_balance():
     assert h4[0, 0].item() == 0.0
 
 
+
+def _slope_sheet(axis, ny=15, nx=21, d=30.0, slope=0.01):
+    """1 cm sheet at rest on a uniform 1 % slope (30 m cells)."""
+    i = torch.arange(nx if axis == 1 else ny, dtype=torch.get_default_dtype())
+    z = slope * d * i
+    z = z.unsqueeze(0).expand(ny, nx) if axis == 1 else z.unsqueeze(1).expand(ny, nx)
+    return z.clone(), torch.full((ny, nx), 0.01)
+
+
+def test_thin_sheet_on_slope_conserves_mass():
+    """Regression (2026-10-20): dt comes from the start-of-step state, where
+    a sheet at rest only has c = sqrt(gh) (dt ~ 43 s); gravity accelerates
+    it by g*S*dt ~ 4 m/s inside the step, the stage-2 Courant number hits
+    ~8 and the h >= 0 clamp used to CREATE ~10 % of the water in 30 steps.
+    The draining-time limiter must hold mass to round-off at cfl 0.45."""
+    for axis in (1, 0):
+        z, h0 = _slope_sheet(axis)
+        for limit in (True, False):
+            s = SWESolver(z, dx=30.0, dy=30.0, n_manning=0.05, order=2,
+                          bc="wall", cfl=0.45, drain_limit=limit)
+            h, qx, qy = h0.clone(), torch.zeros_like(h0), torch.zeros_like(h0)
+            v0 = h.sum().item()
+            for _ in range(30):
+                h, qx, qy, _ = s.step(h, qx, qy)
+            rel = (h.sum().item() - v0) / v0
+            if limit:
+                assert abs(rel) < 1e-10, f"axis {axis}: mass change {rel:.3e}"
+                assert h.min().item() >= 0.0
+            else:   # the fixture really exercises the old failure
+                assert rel > 0.05, f"axis {axis}: unlimited gain only {rel:.3e}"
+
+
+def test_well_balanced_steep_terrain():
+    """Lake at rest over steep, rough 30 m terrain (cell-to-cell slopes of
+    tens of percent, half the domain dry) stays at rest with the limiter
+    active, orders 1 and 2, wall and open boundaries and a basin mask."""
+    ny, nx = 26, 34
+    g = torch.Generator().manual_seed(7)
+    y, x = torch.meshgrid(torch.arange(ny, dtype=torch.get_default_dtype()),
+                          torch.arange(nx, dtype=torch.get_default_dtype()),
+                          indexing="ij")
+    z = (1.2 * x + 8.0 * torch.sin(0.9 * y) * torch.cos(0.7 * x)
+         + 6.0 * torch.rand(ny, nx, generator=g))
+    eta0 = 20.0
+    h = torch.clamp(eta0 - z, min=0.0)
+    assert 0.2 < (h > 0).double().mean().item() < 0.8
+    basin = ((x - nx / 2) / (0.45 * nx)) ** 2 + ((y - ny / 2) / (0.45 * ny)) ** 2 <= 1.0
+    # the masked run needs a divide: a lake touching the sink is not at rest
+    z_div = torch.where(basin, z, z + 60.0)
+    for order in (1, 2):
+        for bc, active, zz in (("wall", None, z), ("open", basin, z_div)):
+            s = SWESolver(zz, dx=30.0, dy=30.0, order=order, bc=bc,
+                          active=active, n_manning=0.05)
+            h0 = torch.clamp(eta0 - zz, min=0.0)
+            wet = h0 > 0
+            h2, qx2, qy2 = s.run(h0.clone(), torch.zeros_like(h), torch.zeros_like(h),
+                                 t_end=600.0)
+            umax = max(qx2.abs().max().item(), qy2.abs().max().item())
+            deta = ((h2 + zz) - eta0)[wet].abs().max().item()
+            assert umax < 1e-12, f"order {order} {bc}: momentum {umax:.3e}"
+            assert deta < 1e-12, f"order {order} {bc}: surface drift {deta:.3e}"
+            assert (h2[~wet] == 0).all(), f"order {order} {bc}: dry cells wetted"
+
+
+def test_gradients_through_drain_limiter():
+    """Autograd matches FD on the slope-sheet case at a fixed 43 s dt,
+    where the limiter is active (theta < 1) in most cells."""
+    z, h0 = _slope_sheet(1, ny=8, nx=12)
+
+    def loss(n, limit=True):
+        s = SWESolver(z, dx=30.0, dy=30.0, n_manning=n, order=2, bc="wall",
+                      drain_limit=limit)
+        h, qx, qy = h0.clone(), torch.zeros_like(h0), torch.zeros_like(h0)
+        for _ in range(8):
+            h, qx, qy, _ = s.step(h, qx, qy, dt=43.0)
+        return (h * torch.linspace(0.5, 1.5, h.shape[1])).sum(), h
+
+    # the fixture really needs the limiter: unlimited, the clamp adds water
+    _, hu = loss(torch.tensor(0.05), limit=False)
+    assert hu.sum().item() > 1.01 * h0.sum().item()
+    p = torch.tensor(0.05, requires_grad=True)
+    loss(p)[0].backward()
+    d = 1e-6
+    g_fd = (loss(torch.tensor(0.05 + d))[0].item() - loss(torch.tensor(0.05 - d))[0].item()) / (2 * d)
+    rel = abs(p.grad.item() - g_fd) / max(abs(g_fd), 1e-8)
+    assert torch.isfinite(p.grad), "non-finite gradient through the limiter"
+    assert rel < 1e-4, f"autograd {p.grad.item():.6e} vs FD {g_fd:.6e} (rel {rel:.2e})"
+
+
+def test_checkpoint_and_dt_every_with_limiter():
+    """checkpoint_every and dt_every keep working: identical forward state
+    and gradient with and without activation checkpointing."""
+    z, h0 = _slope_sheet(1, ny=8, nx=12)
+
+    def run(ck):
+        n = torch.tensor(0.05, requires_grad=True)
+        s = SWESolver(z, dx=30.0, dy=30.0, n_manning=n, order=2, bc="wall")
+        h = h0.clone().requires_grad_(True)
+        h2, _, _ = s.run(h, torch.zeros_like(h0), torch.zeros_like(h0),
+                         t_end=600.0, checkpoint_every=ck, dt_every=3)
+        h2.sum().backward()
+        return h2.detach(), n.grad.item()
+
+    ha, ga = run(0)
+    hb, gb = run(4)
+    assert torch.equal(ha, hb)
+    assert abs(ga - gb) <= 1e-12 * max(1.0, abs(ga))
+    assert abs(ha.sum().item() - h0.sum().item()) / h0.sum().item() < 1e-10
+
+
 if __name__ == "__main__":
     for fn in (test_well_balanced_wet, test_well_balanced_dry_hills,
                test_stoker_dambreak, test_mass_conservation_with_inflow,
-               test_gradients_match_fd, test_basin_mask_sink_and_balance):
+               test_gradients_match_fd, test_basin_mask_sink_and_balance,
+               test_thin_sheet_on_slope_conserves_mass,
+               test_well_balanced_steep_terrain,
+               test_gradients_through_drain_limiter,
+               test_checkpoint_and_dt_every_with_limiter):
         fn()
         print(f"PASS  {fn.__name__}")
     print("all tests passed")

@@ -51,6 +51,9 @@ require_root() { [ "$(id -u)" -eq 0 ] || die "run this with sudo"; }
 on_volume_unmounted() {
   local p=$1 t
   case $p in /media/volume/*) ;; *) return 1 ;; esac
+  # findmnt -T fails on a path that does not exist yet (a fresh volume has
+  # no jobs/ dir): test the deepest existing ancestor instead
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
   t=$(findmnt -n -o TARGET -T "$p" 2> /dev/null || echo /)
   [ "$t" = / ]
 }

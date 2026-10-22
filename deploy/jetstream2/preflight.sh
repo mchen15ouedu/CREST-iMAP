@@ -107,8 +107,12 @@ for d in "${WORKER_WORK_ROOT:?}" "${EVENT_DEM_CACHE:?}" "${HF_HOME:?}"; do
   case $d in
     /media/volume/*)
       # data meant for an attached volume must not land on the root disk
-      # (e.g. after an unshelve without re-attaching the volume)
-      if [ "$(findmnt -n -o TARGET -T "$d" 2> /dev/null || echo /)" = / ]; then
+      # (e.g. after an unshelve without re-attaching the volume). findmnt -T
+      # fails on a missing path, so test the deepest existing ancestor; a
+      # missing dir on a mounted volume is reported by the check below.
+      a=$d
+      while [ ! -e "$a" ] && [ "$a" != / ]; do a=$(dirname "$a"); done
+      if [ "$(findmnt -n -o TARGET -T "$a" 2> /dev/null || echo /)" = / ]; then
         fail "$d is under /media/volume/ but no volume is mounted there - re-attach the volume in Exosphere, then: systemctl reset-failed crest-worker && systemctl start crest-worker"
       fi
       ;;

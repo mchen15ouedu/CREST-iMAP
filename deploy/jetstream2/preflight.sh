@@ -13,14 +13,20 @@ note() { echo "preflight: $*"; }
 
 # 1. token: present as the systemd credential, never in the environment
 [ -z "${HF_TOKEN:-}" ] || fail "HF_TOKEN is set in the environment; remove it (the token comes only from /etc/crest-worker/hf_token)"
-if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
-  [ -s "$CREDENTIALS_DIRECTORY/hf_token" ] || fail "credential hf_token is empty or missing"
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -e "$CREDENTIALS_DIRECTORY/hf_token" ]; then
+  [ -s "$CREDENTIALS_DIRECTORY/hf_token" ] || fail "credential hf_token is empty"
   # crestimap.worker reads ~/huggingface.txt; (re)point it at this start's
   # credential dir (systemd owns that path; never hard-code it)
   ln -sfn "$CREDENTIALS_DIRECTORY/hf_token" "$HOME/huggingface.txt" ||
     fail "cannot update $HOME/huggingface.txt"
   [ "$(readlink -f "$HOME/huggingface.txt")" = "$(readlink -f "$CREDENTIALS_DIRECTORY/hf_token")" ] ||
     fail "$HOME/huggingface.txt does not resolve to the token credential"
+elif [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+  # systemd < 250 (Ubuntu 22.04 ships 249) loads LoadCredential= for ExecStart=
+  # and ExecStopPost= but not for ExecStartPre=: the directory is set and empty
+  # here. run-worker.sh repeats this check where the credential is visible;
+  # the unit's AssertFileNotEmpty= already refused an empty source file.
+  note "credential not visible to ExecStartPre (systemd < 250); run-worker.sh checks it"
 else
   note "not under systemd (no CREDENTIALS_DIRECTORY): token checks skipped"
 fi

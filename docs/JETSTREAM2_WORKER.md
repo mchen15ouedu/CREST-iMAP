@@ -267,6 +267,17 @@ token is therefore never in the unit, the env file or `systemctl show`. The
 unit also refuses to start while the token file is empty
 (`AssertFileNotEmpty=`).
 
+**Ubuntu 22.04 (systemd 249):** `ExecStartPre=` sees `$CREDENTIALS_DIRECTORY`
+set but empty; only `ExecStart=` and `ExecStopPost=` see the credential. This
+was verified on crest-js2-gpu1 on 2026-10-22.
+- `run-worker.sh` therefore repoints and checks the symlink itself.
+- `preflight.sh` only notes the deferral.
+- The start-time `release_claims.py` run (in `ExecStartPre=`, best effort) has
+  no token there, so it cannot release the claims of a crashed run. The
+  `ExecStopPost=` run, which sees the credential, normally releases them. Any
+  claim left behind goes stale after 600 s.
+- systemd 255 on Ubuntu 24.04 has none of this.
+
 ## 7. Validation gates
 
 Record every gate in `docs/JETSTREAM2_VALIDATION.md` in the VM's kit checkout,
@@ -281,9 +292,30 @@ nvidia-smi
 nvidia-smi -q | grep -iE 'Virtualization Mode|MIG'
 nvidia-smi -q | grep -iA2 'vGPU Software Licensed Product'   # g3.large and smaller
 sudo /opt/crest-worker/bin/bootstrap.sh --check-token
-sudo /opt/crest-worker/bin/crest-py CRESTIMAP_TEST_DEVICE=cuda -m pytest -q -p no:cacheprovider crestimap/tests
+sudo /opt/crest-worker/bin/crest-py CRESTIMAP_TEST_DEVICE=cuda -m pytest -q -p no:cacheprovider \
+  --ignore=crestimap/tests/test_burn_screen.py crestimap/tests
 sudo /opt/crest-worker/bin/healthcheck.sh
 ```
+
+`test_burn_screen.py` loads `tools/burn_channels.py`, a DEM-burn tool that is
+not in a release (releases carry `crestimap/` only) and that the worker never
+calls. Without `--ignore`, collection stops with FileNotFoundError.
+
+Known CUDA test-harness failures at `c5184759`, first seen on crest-js2-gpu1 on
+2026-10-22:
+- `test_forcing.py` and `test_solver.py` call `torch.set_default_device(DEVICE)`
+  at import. In one pytest process that default leaks into the files after
+  them, so 7 tests in `test_event.py`, `test_session.py` and `test_tiled.py` fail
+  with "can't convert cuda:0 device type tensor to numpy". Run those three
+  files in their own processes, for example
+  `... -m pytest -q -p no:cacheprovider crestimap/tests/test_session.py`. All 9
+  passed there.
+- `test_solver.py::test_well_balanced_steep_terrain` draws `torch.rand` from a
+  CPU generator while the default device is cuda, so it fails on CUDA in
+  every setup.
+
+Both are test-setup bugs. The worker never sets a default device, and the G1
+replay drives the same session code on the GPU.
 
 Pass criteria:
 - The driver is ≥ 525, and its version is recorded.

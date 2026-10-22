@@ -14,6 +14,18 @@ REL=$(readlink -e "$CREST_HOME/current") || {
 # The token is read by crestimap.worker from ~/huggingface.txt (a symlink to
 # the systemd credential). Never take it from the environment.
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+# Point the symlink at this start's credential here as well as in preflight:
+# on systemd < 250 ExecStartPre= cannot see LoadCredential= files.
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+  if [ ! -s "$CREDENTIALS_DIRECTORY/hf_token" ]; then
+    echo "run-worker: credential hf_token is empty or missing" >&2
+    exit 1
+  fi
+  ln -sfn "$CREDENTIALS_DIRECTORY/hf_token" "$HOME/huggingface.txt" || {
+    echo "run-worker: cannot update ~/huggingface.txt" >&2
+    exit 1
+  }
+fi
 if [ ! -s "$HOME/huggingface.txt" ]; then
   echo "run-worker: ~/huggingface.txt does not resolve to a non-empty token credential" >&2
   exit 1
